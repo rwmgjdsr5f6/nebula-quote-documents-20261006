@@ -4,6 +4,7 @@
 仅使用 Python 3 标准库与本地 SQLite：
   python quote.py save    --db demo.sqlite --input quote.json
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
+  python quote.py list    --db demo.sqlite
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
 """
@@ -322,6 +323,31 @@ def cmd_preview(args):
     return 0
 
 
+def cmd_list(args):
+    # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
+    db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
+    try:
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
+            # number 使用默认 BINARY 排序，与保存先后无关；旧库缺 note 列不影响本查询。
+            rows = conn.execute(
+                "SELECT number, customer, total FROM quotes ORDER BY number"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return fail(f"无法读取数据库 {args.db}: {exc}")
+
+    # 原文输出编号与客户，不做转义或裁剪；total 为分单位整数，不换算。
+    records = [
+        {"number": number, "customer": customer, "total": total}
+        for number, customer, total in rows
+    ]
+    sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="报价单保存与 HTML 预览")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -336,6 +362,10 @@ def build_parser():
     preview_parser.add_argument("--number", required=True, help="报价编号（原文精确匹配）")
     preview_parser.add_argument("--output", required=True, help="输出 HTML 路径（目录需已存在）")
     preview_parser.set_defaults(handler=cmd_preview)
+
+    list_parser = subparsers.add_parser("list", help="列出已保存报价的编号、客户与合计")
+    list_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    list_parser.set_defaults(handler=cmd_list)
 
     return parser
 
