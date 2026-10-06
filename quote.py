@@ -140,6 +140,8 @@ def cmd_save(args):
             raw_text = f.read()
     except OSError as exc:
         return fail(f"无法读取输入文件 {args.input}: {exc}")
+    except UnicodeDecodeError:
+        return fail(f"输入文件不是有效的 UTF-8: {args.input}")
 
     try:
         payload = json.loads(raw_text)
