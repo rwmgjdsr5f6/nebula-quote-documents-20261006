@@ -22,7 +22,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS quotes (
     number   TEXT PRIMARY KEY,
     customer TEXT NOT NULL,
-    total    INTEGER NOT NULL
+    total    INTEGER NOT NULL,
+    note     TEXT
 );
 CREATE TABLE IF NOT EXISTS items (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,8 +65,9 @@ def require_nonblank_str(value, label):
 
 
 def validate_quote(payload):
-    """校验并规范化输入，返回 (number, customer, items, total)。
+    """校验并规范化输入，返回 (number, customer, note, items, total)。
 
+    note 为 None 表示无说明；非空说明原样保留，不做去除空白处理。
     items 中每项为 (description, quantity, unit_price, line_amount)。
     合法文本原样保留，不做去除空白处理。
     """
@@ -78,6 +80,16 @@ def validate_quote(payload):
 
     number = require_nonblank_str(payload["number"], "编号")
     customer = require_nonblank_str(payload["customer"], "客户")
+
+    # note 可选：省略或空字符串表示无说明；一旦出现（含 null）就必须是字符串，
+    # 非空内容原样保留。
+    note = None
+    if "note" in payload:
+        note = payload["note"]
+        if not isinstance(note, str):
+            raise ValidationError("note 必须是字符串")
+        if note == "":
+            note = None
 
     raw_items = payload["items"]
     if not isinstance(raw_items, list):
@@ -121,7 +133,7 @@ def validate_quote(payload):
     if total > INT64_MAX:
         raise ValidationError("合计金额超出有符号64位整数范围")
 
-    return number, customer, items, total
+    return number, customer, note, items, total
 
 
 def open_database(path):
@@ -132,6 +144,10 @@ def open_database(path):
 
 def ensure_schema(conn):
     conn.executescript(SCHEMA)
+    # 旧库没有 note 列：就地补列，已有报价的 note 为 NULL（无说明），无需重建。
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+    if "note" not in columns:
+        conn.execute("ALTER TABLE quotes ADD COLUMN note TEXT")
 
 
 def cmd_save(args):
@@ -150,7 +166,7 @@ def cmd_save(args):
         return fail(f"JSON 解析失败: {exc}")
 
     try:
-        number, customer, items, total = validate_quote(payload)
+        number, customer, note, items, total = validate_quote(payload)
     except ValidationError as exc:
         return fail(str(exc))
 
@@ -166,8 +182,8 @@ def cmd_save(args):
         with conn:
             try:
                 conn.execute(
-                    "INSERT INTO quotes(number, customer, total) VALUES (?, ?, ?)",
-                    (number, customer, total),
+                    "INSERT INTO quotes(number, customer, total, note) VALUES (?, ?, ?, ?)",
+                    (number, customer, total, note),
                 )
             except sqlite3.IntegrityError:
                 raise DuplicateNumber(number)
@@ -195,7 +211,7 @@ def format_yuan(cents):
     return f"{cents // 100}.{cents % 100:02d}"
 
 
-def render_html(number, customer, items, total):
+def render_html(number, customer, note, items, total):
     e = html.escape
     rows = "\n".join(
         "      <tr>"
@@ -207,6 +223,18 @@ def render_html(number, customer, items, total):
         "</tr>"
         for position, (description, quantity, unit_price, line_amount) in enumerate(items)
     )
+    # 有说明时在客户信息之后、明细表格之前展示；pre-wrap 保留空格与换行。
+    # 无说明时不出现该区域，页面其余内容与样式与原先逐字节一致。
+    note_style = ""
+    note_section = ""
+    if note:
+        note_style = "\n  .note-text { white-space: pre-wrap; }"
+        note_section = (
+            '<section class="note">\n'
+            "  <h2>客户说明</h2>\n"
+            f'  <p class="note-text">{e(note)}</p>\n'
+            "</section>\n"
+        )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -217,7 +245,7 @@ def render_html(number, customer, items, total):
   table {{ border-collapse: collapse; margin-top: 1em; }}
   th, td {{ border: 1px solid #999; padding: 0.4em 0.8em; }}
   .num {{ text-align: right; white-space: nowrap; }}
-  tfoot td {{ font-weight: bold; }}
+  tfoot td {{ font-weight: bold; }}{note_style}
 </style>
 </head>
 <body>
@@ -226,7 +254,7 @@ def render_html(number, customer, items, total):
   <dt>报价编号</dt><dd>{e(number)}</dd>
   <dt>客户</dt><dd>{e(customer)}</dd>
 </dl>
-<table>
+{note_section}<table>
   <thead>
     <tr><th>#</th><th>说明</th><th>数量</th><th>单价（元）</th><th>行金额（元）</th></tr>
   </thead>
@@ -252,15 +280,23 @@ def cmd_preview(args):
     try:
         conn = sqlite3.connect(db_uri, uri=True)
         conn.execute("PRAGMA foreign_keys = ON")
-        cursor = conn.execute(
-            "SELECT customer, total FROM quotes WHERE number = ?",
-            (args.number,),
-        )
+        # 旧库可能没有 note 列（只读打开不能补列），此时一律视为无说明。
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+        if "note" in columns:
+            cursor = conn.execute(
+                "SELECT customer, total, note FROM quotes WHERE number = ?",
+                (args.number,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT customer, total, NULL FROM quotes WHERE number = ?",
+                (args.number,),
+            )
         quote_row = cursor.fetchone()
         if quote_row is None:
             conn.close()
             return fail(f"报价编号不存在: {args.number}")
-        customer, total = quote_row
+        customer, total, note = quote_row
         item_rows = conn.execute(
             "SELECT description, quantity, unit_price, line_amount "
             "FROM items WHERE quote_number = ? ORDER BY position",
@@ -270,7 +306,7 @@ def cmd_preview(args):
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
-    document = render_html(args.number, customer, item_rows, total)
+    document = render_html(args.number, customer, note, item_rows, total)
 
     # O_EXCL 兜底：即使并发出现同名文件也不覆盖。
     try:
