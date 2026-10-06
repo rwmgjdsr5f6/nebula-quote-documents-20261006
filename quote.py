@@ -271,6 +271,47 @@ def render_html(number, customer, note, items, total):
 """
 
 
+def create_file_fully(path, data):
+    """新建文件并把 data 完整写出，任何情况下都不覆盖已有文件。
+
+    返回 None 表示成功；否则返回失败原因（字符串），由调用方按失败处理。
+    本地 write 只接受部分字节时继续写出剩余部分，直到全部写完并正常关闭；
+    write 返回 0 表示无法取得进展，按失败结束。写入或关闭抛出 OSError 时
+    返回实际错误原因，此前已写出的部分内容保留在目标文件中。
+    """
+    try:
+        # O_EXCL 兜底：即使并发出现同名文件也不覆盖。
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        return str(exc)
+
+    reason = None
+    closed = False
+    try:
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                reason = (
+                    "写入未取得进展：本次写入返回 0 字节，"
+                    f"仍有 {len(remaining)} 字节尚未写出"
+                )
+                break
+            remaining = remaining[written:]
+        if reason is None:
+            os.close(fd)
+            closed = True
+    except OSError as exc:
+        reason = str(exc)
+    finally:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return reason
+
+
 def cmd_preview(args):
     # 输出目标已存在时直接拒绝，绝不覆盖。
     if os.path.exists(args.output):
@@ -309,15 +350,9 @@ def cmd_preview(args):
 
     document = render_html(args.number, customer, note, item_rows, total)
 
-    # O_EXCL 兜底：即使并发出现同名文件也不覆盖。
-    try:
-        fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        try:
-            os.write(fd, document.encode("utf-8"))
-        finally:
-            os.close(fd)
-    except OSError as exc:
-        return fail(f"无法写入输出文件 {args.output}: {exc}")
+    reason = create_file_fully(args.output, document.encode("utf-8"))
+    if reason is not None:
+        return fail(f"无法写入输出文件 {args.output}: {reason}")
 
     print(args.output)
     return 0
