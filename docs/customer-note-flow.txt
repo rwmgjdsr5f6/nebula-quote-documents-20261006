@@ -1,0 +1,424 @@
+客户说明（note）流转说明：JSON 输入 → SQLite → HTML 预览
+=========================================================
+
+本说明只讲一件事：可选字段 note 怎样从输入 JSON 被读取、怎样落进 SQLite、
+又怎样出现在预览 HTML 里；并给出同一条链路上的边界行为，供逐项对照源码。
+
+核对基准与表述约定
+------------------
+- 产品源码：仓库根目录 quote.py（唯一可执行源码）。本说明中的行号均以当前
+  版本 quote.py 为准，引用方式为 quote.py:<行号>。
+- 公开行为以 README.md 记载的命令行用法为准；本文不新增、不改写任何命令。
+- 回归测试：tests/test_note_flow.py 为 note 专项，其余 tests/test_*_flow.py
+  覆盖金额、重复编号、list、预览与写文件等既有行为。
+- 标注约定：
+  【源码】= 只凭阅读 quote.py 即可确定的事实，未额外执行；
+  【实测】= 本次在仓库外临时目录用 README 记载的公开命令实际运行所得。
+  实测环境：Linux、Python 3.14.4，数据库与 HTML 均生成在 /tmp 下的临时
+  目录，仓库内未留下任何 JSON/SQLite/HTML；产品源码、README、命令与数据库
+  格式均未修改。实测后运行 python3 -m unittest discover -s tests，32 个
+  用例全部通过。
+- 既有文档 docs/quotation-flow.txt 写于 note 字段引入之前，其第二节
+  “额外字段（如 total、note）……直接忽略”的说法对当前版本已不适用；该文档
+  本次不改动，note 的现行行为以本说明与 quote.py 为准。
+
+
+一、全链路与关键代码位置
+------------------------
+链路仍是两个相互独立的进程，note 全程随报价单一起传递，不单独存取：
+
+  save：读 JSON → 校验/规范化（含 note）→ 打开数据库（必要时补 note 列）
+        → 写 quotes 行（含 note）→ 写 items 行
+  preview：检查输出路径 → 只读打开数据库 → 探测 note 列是否存在
+        → 读 quotes 行（含 note 或补 NULL）→ 读 items 行 → 渲染 HTML
+
+note 相关代码位置一览：
+
+  环节                         函数                位置
+  ----------------------------------------------------------------
+  新库建表含 note 列           SCHEMA              quote.py:22-38（note 在 27 行）
+  note 的读取与规范化          validate_quote()    quote.py:85-93
+  校验先于打开数据库           cmd_save()          quote.py:169-178
+  旧库补 note 列              ensure_schema()     quote.py:146-151
+  补列事务 / 写入事务          cmd_save()          quote.py:181-182 / 183-198
+  quotes 行写入 note          cmd_save()          quote.py:185-188
+  预览时探测 note 列          cmd_preview()       quote.py:285
+  有列/无列两条 SELECT        cmd_preview()       quote.py:286-295
+  说明区域的构造与转义        render_html()       quote.py:227-238
+  说明区域在页面中的插槽      render_html()       quote.py:249（样式）、258（区块）
+  list 不读 note              cmd_list()          quote.py:353-355
+
+说明：save 端把 note 存进主表 quotes 的同一行；preview 端把它读回后交给
+render_html()。note 不参与金额计算，validate_quote() 返回的 total 只来自
+items（quote.py:133），渲染端也不按 note 改变任何金额。
+
+
+二、JSON 输入端：读取与规范化
+-----------------------------
+cmd_save() 先以 UTF-8 读完整份文件（quote.py:156-162），再用 json.loads
+解析（quote.py:164-167），然后调用 validate_quote()（quote.py:169-172）。
+note 的全部规则集中在 quote.py:85-93：
+
+  note = None
+  if "note" in payload:
+      note = payload["note"]
+      if not isinstance(note, str):
+          raise ValidationError("note 必须是字符串")
+      if note == "":
+          note = None
+
+由此【源码】可确定四种形态：
+
+  1. 省略 note 键            → note 为 None，表示无说明；
+  2. "note": ""（空字符串）  → 归一成 None，表示无说明；
+  3. 非空字符串（含纯空白）  → 原样作为 note，不做 strip、不替换任何字符；
+  4. 键存在但值不是字符串    → ValidationError("note 必须是字符串")。
+
+规范化结果随 validate_quote() 的返回值带出（函数签名与文档字符串见
+quote.py:68-74），随后作为参数原样出现在 INSERT 语句里（quote.py:185-188），
+中间没有第二处加工，所以首尾空格与换行逐字符入库。
+
+要点：note 与 number/customer 的“非空白”要求不同。require_nonblank_str()
+会拒绝纯空白（quote.py:60-65），但它只用于 number、customer 与明细
+description（quote.py:82-83、110），从不出现在 note 的处理路径上。因此
+“  \n\n ”这类只含空格换行的非空字符串对 note 合法，对 number 则不合法。
+
+校验先于打开数据库：validate_quote() 的调用（quote.py:169-172）在
+open_database()（quote.py:175-178）之前，中间隔着注释“校验全部通过后才
+触碰数据库”（quote.py:174）。所以 note 类型非法时，数据库连接根本不会
+建立，新路径不会留下数据库文件。【实测】见第六节。
+
+
+三、SQLite 端：保存、补列与提交边界
+-----------------------------------
+3.1 新库
+
+新数据库由 ensure_schema() 执行 SCHEMA 建表（quote.py:146-147），quotes
+表本就包含 note 列（quote.py:23-28）：
+
+  CREATE TABLE IF NOT EXISTS quotes (
+      number   TEXT PRIMARY KEY,
+      customer TEXT NOT NULL,
+      total    INTEGER NOT NULL,
+      note     TEXT
+  );
+
+note 可空、无默认值、无约束。保存时主行 INSERT 显式带上 4 个值
+（quote.py:185-188）：
+
+  INSERT INTO quotes(number, customer, total, note) VALUES (?, ?, ?, ?)
+
+参数即 (number, customer, total, note)，note 为 None 时绑定 SQL NULL，
+为字符串时绑定原文。items 的写入与 note 无关（quote.py:191-198）。
+
+3.2 没有 note 列的旧库：直接 preview
+
+cmd_preview() 以只读 URI 打开数据库（file:<绝对路径>?mode=ro，
+quote.py:280-282），随后用 PRAGMA table_info(quotes) 取列名集合
+（quote.py:285）：
+
+  - 有 note 列：SELECT customer, total, note FROM quotes WHERE number = ?
+    （quote.py:287-290）
+  - 无 note 列：SELECT customer, total, NULL FROM quotes WHERE number = ?
+    （quote.py:292-295）
+
+【源码】因此旧库无需任何结构改动即可预览：缺列时第三列直接由 SQL 补成
+NULL，经 quote_row 解包为 note=None（quote.py:300），渲染时按“无说明”
+处理。只读连接本身也无法执行 ALTER。
+
+【实测】对一个手工建立、quotes 只有 number/customer/total 三列且含一张
+Q-OLD 旧报价的库直接 preview：退出码 0、正常生成 HTML、页面无说明区域；
+预览前后 PRAGMA table_info(quotes) 与 sqlite_master 快照完全一致，旧行
+不变。旧库直接跑 list 同样成功且不补列（list 的查询不涉及 note，
+quote.py:353-355）。
+
+3.3 没有 note 列的旧库：随后合法 save 如何补列
+
+ensure_schema() 在建表脚本之后检查列集合，缺列时执行
+ALTER TABLE quotes ADD COLUMN note TEXT（quote.py:149-151）。SQLite 的
+ADD COLUMN 对已有行填 NULL，不重写、不删除旧数据。
+
+【实测】对上述旧库用一个新编号（Q-NEW）带说明合法保存后：
+  - quotes 列变为 number/customer/total/note；
+  - 旧报价 Q-OLD 的 number/customer/total 与全部 items 行原样保留，
+    其 note 为 NULL；
+  - 新报价 Q-NEW 的 note 可逐字符读回输入原文；
+  - 此后再预览 Q-OLD，仍按无说明展示，且与补列前的首次预览逐字节一致
+    （内容只取决于数据行，旧行的 NULL 与“缺列补 NULL”结果相同）。
+
+3.4 两个提交边界（重要，易误述）
+
+cmd_save() 中结构变更与业务写入分处两个独立事务（quote.py:181-198）：
+
+  with conn:
+      ensure_schema(conn)          # 事务一：建表（IF NOT EXISTS）+ 必要时 ALTER
+  with conn:
+      INSERT quotes ...            # 事务二：主行 + 明细
+      executemany items ...
+
+【源码】第一个 with 块正常结束即提交：一旦执行了 ALTER ADD COLUMN，note
+列就已持久化。第二个 with 块里主行 INSERT 若因主键冲突抛
+sqlite3.IntegrityError，被转成 DuplicateNumber（quote.py:189-190），回滚
+的只是事务二——主行和明细不留本次数据；它不可能连带回滚事务一里已经
+提交的 ALTER。
+
+【实测】向旧库重复保存已存在的编号 Q-OLD（其余输入合法、带 note）：
+退出码 1，stderr 为“错误: 报价编号已存在: Q-OLD”，quotes/items 的行数
+与内容不变，但 quotes 已多出 note 列，旧行该列为 NULL。
+
+因此准确的说法是：重复编号保存失败时，本次报价数据不写入、旧行内容不变；
+但如果这次进程顺带完成了旧库补列，结构变化已经提交。不能把“重复编号
+拒绝”笼统描述成“旧库结构必然不变”，也不能说成“旧数据被改动”。
+（本节实测覆盖重复编号这一种失败路径；其他 sqlite3.Error 失败路径下
+“补列已提交、数据事务回滚”的效果由同样的代码结构【源码】可证。）
+
+
+四、HTML 预览端：区域位置、空白保留与转义
+-----------------------------------------
+4.1 区域何时出现、出现在哪
+
+render_html() 对说明的开关只有一个真值判断（quote.py:229-238）：
+
+  note_style = ""
+  note_section = ""
+  if note:
+      note_style = "\n  .note-text { white-space: pre-wrap; }"
+      note_section = (
+          '<section class="note">\n'
+          "  <h2>客户说明</h2>\n"
+          f'  <p class="note-text">{e(note)}</p>\n'
+          "</section>\n"
+      )
+
+【源码】note 为 None（省略或空字符串归一化）或读回 NULL 时为假，不生成
+section，也不注入样式规则；note 为任何非空字符串（包括纯空白）时为真。
+页面模板里，{note_section} 位于客户信息定义列表 </dl> 之后、明细表格
+<table> 之前（quote.py:254-258），样式规则经 {note_style} 注入
+（quote.py:249）。无说明时 note_section 是空串，页面其余部分与无 note
+版本逐字节相同。
+
+4.2 空格与换行为什么能保留
+
+两道机制共同起作用：
+  1. 数据侧：note 原文逐字符存入、读回（见第二、三节），换行就是真实的
+     LF（0x0A），不是反斜杠加 n；
+  2. 样式侧：white-space: pre-wrap（quote.py:232）让浏览器保留连续空格与
+     文本中的换行，<p> 还会随宽度自动折行。若没有这条规则，HTML 默认会
+     把连续空白折叠成一个空格、把 LF 当普通空白。
+
+【实测】纯空白说明 "  \n\n " 保存后预览，页面出现说明区域，解析出的文本
+逐字符等于该串；省略 note 与空字符串两种输入的预览则无区域、无
+.note-text 样式。
+
+4.3 转义：为什么显示原文而不会生成 script 元素
+
+e 是 html.escape 的别名（quote.py:216），说明正文经 e(note) 输出
+（quote.py:236）。Python 标准库 html.escape 默认 quote=True，把
+& < > 转成 &amp; &lt; &gt;，并转义引号。下用 ␠ 表示空格、↵ 表示换行，
+以本说明样例的 note 为例，源文与转义后文本的逐字符对应是：
+
+  原文（两行，首尾各两个空格）：
+    ␠␠<script>演示</script>↵
+    &lt;原文&gt;␠␠
+  e(note) 输出（这里的 \n 就是上面那个真实换行字节，不是反斜杠加 n）：
+    ␠␠&lt;script&gt;演示&lt;/script&gt;\n&amp;lt;原文&amp;gt;␠␠
+
+实际写入 note.html 的源文逐字如下（注意第二行行首在第 0 列、没有缩进；
+那个换行是 note 自带的，<p> 标签本身的两空格缩进只在第一行）：
+--------
+  <p class="note-text">  &lt;script&gt;演示&lt;/script&gt;
+&amp;lt;原文&amp;gt;  </p>
+--------
+
+【实测】用 html.parser.HTMLParser 解析生成的 note.html：全部起始标签中
+没有 script；<p class="note-text"> 内解析出的文本逐字符等于输入原文。
+原因：HTML 解析器只把字面的 < 当作标签起始；源文里的尖括号已变成
+&lt; / &gt; 这几个普通字符，解析时再还原为屏幕上的 “<” “>”，所以
+<script>演示</script> 只作为文字显示，不会产生 script 元素，也不存在
+可执行内容。文档里其他用户文本（编号、客户、明细说明）同理，均经过
+同一个 e()（quote.py:220、243、255-256）。
+
+4.4 原文里的实体形式为什么仍是原文
+
+样例第二行用户写的是 &lt;原文&gt; —— 对程序而言它是一串普通字符，其中
+开头的 &lt; 是 &、l、t、; 四个字符，不是 HTML 源码里的标签或实体。转义
+先处理 &：每个 & 变成 &amp;，于是源文里出现的是 &amp;lt;原文&amp;gt;。
+解析器解码一层得到 “&lt;原文&gt;” 这串文字就停止，不会把它再当成实体
+解成 “<原文>”。
+
+【实测】生成的 HTML 包含子串 &amp;lt;原文&amp;gt;，且不包含子串
+&lt;原文&gt;（即未转义形态）；解析器还原出的可见文本正是
+&lt;原文&gt; 本身。这也意味着“实体转义只做一层、由渲染端完成”：保存时
+不做任何转义，库里存的永远是用户原文。
+
+4.5 金额不在这条链路上变化
+
+note 不影响金额。样例的行金额 = 2 × 1250 = 2500（分）（quote.py:127），
+合计同为 2500（分）（quote.py:133，仅一行）。预览的金额换算函数
+format_yuan 为 f"{cents // 100}.{cents % 100:02d}"（quote.py:210-212），
+纯整数运算：1250 分显示 12.50，2500 分显示 25.00。单价、行金额、总计
+三处都经此函数（quote.py:222-223、266）。
+
+
+五、端到端样例：Q-NOTE-DEMO（可直接照做）
+------------------------------------------
+以下输入、命令与结果均【实测】（临时目录、新数据库 demo.sqlite）。
+
+5.1 输入文件 note-demo.json（UTF-8；note 首尾各两个空格，两行文字，
+第一行 <script>演示</script>，第二行 &lt;原文&gt;）：
+
+{
+  "number": "Q-NOTE-DEMO",
+  "customer": "演示客户",
+  "note": "  <script>演示</script>\n&lt;原文&gt;  ",
+  "items": [
+    {
+      "description": "咨询",
+      "quantity": 2,
+      "unit_price": 1250
+    }
+  ]
+}
+
+字符层面提醒：JSON 文本里的 \n 是两个字符的转义序列，json.loads 解析后
+成为一个换行符；两个前导空格在值引号内的最前面，两个尾随空格在引号前。
+
+5.2 保存（README“保存报价单”一节的用法，数据库取 demo.sqlite）：
+
+  python3 quote.py save --db demo.sqlite --input note-demo.json
+
+预期（实测一致）：
+  退出码 0
+  标准输出恰好一行：Q-NOTE-DEMO
+  标准错误为空
+
+保存后的可核对事实：
+  - quotes 行：number=Q-NOTE-DEMO，customer=演示客户，total=2500（分），
+    note 逐字符为 "  <script>演示</script>\n&lt;原文&gt;  "；
+  - items 行：position=0，description=咨询，quantity=2，unit_price=1250，
+    line_amount=2500；合计 2500 分即 2 × 1250，note 不参与计算。
+
+5.3 预览（note.html 此前不存在）：
+
+  python3 quote.py preview --db demo.sqlite --number Q-NOTE-DEMO --output note.html
+
+预期（实测一致）：
+  退出码 0
+  标准输出恰好一行：note.html
+  标准错误为空；同目录新建 UTF-8 文件 note.html
+
+5.4 预览页面中可核对的关键片段（实测自生成文件）。
+
+说明区域相对位置：</dl> 之后、<table> 之前。下面用 ---- 定界的整块即
+note.html 中的连续原文，定界符之间不从属本文档缩进：第二行 "&amp;lt;..."
+顶格、左侧没有空格——那是 note 内嵌换行后的真实样子（区块自身的两空格
+缩进只作用于第一行的 <p> 起始标签）：
+----
+</dl>
+<section class="note">
+  <h2>客户说明</h2>
+  <p class="note-text">  &lt;script&gt;演示&lt;/script&gt;
+&amp;lt;原文&amp;gt;  </p>
+</section>
+<table>
+----
+
+金额行与总计（定界符之间同为文件原文）：
+----
+      <tr><td>1</td><td>咨询</td><td class="num">2</td><td class="num">12.50</td><td class="num">25.00</td></tr>
+    <tr><td colspan="4">总计（元）</td><td class="num">25.00</td></tr>
+----
+
+即：保存合计 2500 分，预览总计 25.00 元（单价显示 12.50 元、数量 2）。
+说明区域出现在客户信息之后、明细表格之前。浏览器按上面的源文渲染后，
+屏幕上呈现为两行用户原文（下用 ␠ 标出被 pre-wrap 保留的首尾空格，页面
+上 ␠ 就是普通空白）；转义的来由见 4.3、实体形态为何仍是原文见 4.4：
+
+  ␠␠<script>演示</script>
+  &lt;原文&gt;␠␠
+
+其中的 <script> 只是字面文字，文档里不存在 script 元素（经
+html.parser 解析确认，可见标签仅 section/h2/p 等页面自身标签）。
+
+
+六、边界行为清单（实测，附源码依据）
+------------------------------------
+统一失败出口 fail()：stderr 打印“错误: <原因>”并返回退出码 1
+（quote.py:49-52）。下列结果均为本次实测，命令形式同第五节。
+
+  情形                         退出码 / stdout / stderr                    副作用与源码依据
+  ------------------------------------------------------------------------------------------------
+  省略 note 键                 0；stdout 为编号一行                         库存 NULL；预览无说明区域、
+                                                                           无 .note-text 样式；quote.py:87-89、231
+  "note": ""（空字符串）       0；stdout 为编号一行                         归一为 NULL，表现同上；quote.py:92-93
+  "note": "  \n\n "（纯空白）  0；stdout 为编号一行                         原文保存；预览出现说明区域，
+                                                                           空白与换行保留；quote.py:85-91、231-238
+  "note": null                 1；stdout 为空；                             quote.py:90-91 抛错；校验在开库前
+                               stderr“错误: note 必须是字符串”              （quote.py:169-178），新路径不留库文件
+  "note": 42（数字）           1；stdout 为空；                             同上；JSON 数字解析为 int，
+                               stderr“错误: note 必须是字符串”              isinstance 检查拒绝（quote.py:90-91）
+  "note": true（布尔）         1；stdout 为空；                             同上；bool 不被当作字符串，
+                               stderr“错误: note 必须是字符串”              也没有进入整数判定路径
+  旧库（无 note 列）直接 preview 0；stdout 为输出路径一行                   按无说明展示，不补列、不改行；
+                                                                           只读 URI 与 SELECT ..., NULL；
+                                                                           quote.py:280-295
+  旧库随后合法 save（新编号）   0；stdout 为新编号一行                       ALTER 补 note 列；旧报价保留且
+                                                                           note 为 NULL，新报价写入原文；
+                                                                           quote.py:149-151、185-198
+  旧库上重复保存已存在编号      1；stdout 为空；                             数据事务回滚、旧行不变，但补列
+                               stderr“错误: 报价编号已存在: <编号>”         已在先前事务提交（见 3.4）；
+                                                                           quote.py:181-200
+  list（无论库中有无 note 列）  0；stdout 为 JSON 一行                       仅 number/customer/total，整数合计
+                                                                           不换算、不输出 note；quote.py:353-366
+
+关于 null/数字/布尔三种拒绝，【实测】在全新的数据库路径上执行后，对应
+.sqlite 文件均不存在（校验先于 open_database）；在已存在的数据库上重复
+触发这些拒绝后，原有 quotes/items 行前后快照不变。tests/test_note_flow.py
+中 NoteRejectionTestCase（tests:308-406）对这两点均有断言。
+
+以下行为属于既有逻辑，note 引入后保持原样（本次实测确认，规则本身与
+note 无关）：
+  - 编号精确匹配：preview 的 WHERE number = ? 用命令行原文绑定
+    （quote.py:287-295）。实测 "Q-NOTE-DEMO" 可以命中，"Q-NOTE-DEMO "
+    （尾随空格）报“错误: 报价编号不存在: Q-NOTE-DEMO ”，退出码 1，不生
+    成输出文件；不存在模糊匹配或 trim。
+  - 重复编号拒绝：任何编号第二次 save 都在主键冲突处失败（quote.py:189-200），
+    没有更新/覆盖入口；带不带 note 都一样。
+  - 预览不覆盖已有文件：os.path.exists 先检查（quote.py:276-277），写入再
+    用 O_EXCL 兜底（quote.py:314）。实测 note.html 已存在时再次 preview，
+    退出码 1、报“错误: 输出文件已存在: note.html”，原文件不变。
+  - list 输出形态不变：实测 demo.sqlite 的 list 结果为
+    [{"number": "Q-NOTE-DEMO", "customer": "演示客户", "total": 2500}]，
+    只有编号、客户与以分为单位的整数合计，即使该报价实际带 note 也不出现
+    该字段。
+
+
+七、顺着源码逐项复核的入口
+--------------------------
+建议按数据流向阅读，每个节点都能在 quote.py 直接定位：
+
+  1. 输入规则：validate_quote() 的 note 分支 quote.py:85-93，对照
+     require_nonblank_str()（quote.py:60-65）理解“纯空白为何只对 note
+     合法”。
+  2. 落库：INSERT 语句 quote.py:185-188；可用 sqlite3 直查
+     SELECT number, total, quote(note) FROM quotes（SQLite 的 quote()
+     会给文本加单引号、给 NULL 返回 NULL，便于看出首尾空格与 NULL 的
+     区别；第五节的核对即用此法）。
+  3. 补列：ensure_schema() quote.py:146-151，配合两个 with conn 事务
+     quote.py:181-198 理解 3.4 的提交边界。
+  4. 读回：cmd_preview() 的列探测与两条 SELECT quote.py:285-295。
+  5. 渲染：render_html() quote.py:215-271，重点是 e = html.escape
+     （216 行）、note 分支（227-238 行）与模板插槽（249、258 行）。
+
+专项回归测试 tests/test_note_flow.py（均通过 README 的公开命令驱动
+quote.py 子进程）与本文各节对应：
+  - 正常往返、转义与金额：test_note_roundtrip_save_then_preview
+    （tests:221-261）→ 对应第四、五节；
+  - 省略/空字符串无区域：test_omitted_or_empty_note_hides_section
+    （tests:263-288）→ 第二节形态 1/2、第六节；
+  - 纯空白仍保存并显示：test_whitespace_only_note_saved_and_shown
+    （tests:290-305）→ 第二节形态 3、4.2；
+  - 非法类型拒绝且无库副作用：NoteRejectionTestCase（tests:308-406）
+    → 第二节形态 4、第六节；
+  - 旧库先预览后保存、补列与 NULL 边界：LegacyDatabaseNoteTestCase
+    （tests:409-611）→ 第三节全部。
