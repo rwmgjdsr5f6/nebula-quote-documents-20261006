@@ -257,5 +257,145 @@ class AmountFlowTestCase(unittest.TestCase):
         self.assertEqual(snapshot(), before, "校验失败后已有数据库内容必须保持不变")
 
 
+class Utf8InputTestCase(unittest.TestCase):
+    """非 UTF-8 输入的拒绝路径：可预测报错、无数据库副作用。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="quote-utf8-test-")
+        self.addCleanup(self._tmp.cleanup)
+        self.workdir = self._tmp.name
+
+    def run_quote(self, *cli_args):
+        return subprocess.run(
+            [sys.executable, QUOTE_PY, *cli_args],
+            capture_output=True,
+            text=True,
+            cwd=self.workdir,
+        )
+
+    def write_bytes(self, data, name="bad.json"):
+        path = os.path.join(self.workdir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def assert_utf8_rejected(self, path, db_path):
+        """退出码 1、标准输出为空、标准错误恰为一行编码错误、数据库不创建。"""
+        result = self.run_quote("save", "--db", db_path, "--input", path)
+        self.assertEqual(
+            result.returncode, 1,
+            msg=f"非法 UTF-8 应退出码 1，实际 {result.returncode}；stderr={result.stderr!r}",
+        )
+        self.assertEqual(result.stdout, "", msg="拒绝时标准输出必须为空")
+        self.assertEqual(
+            result.stderr,
+            f"错误: 输入文件不是有效的 UTF-8: {path}\n",
+            msg="标准错误应只有一行编码错误并使用 --input 路径原文",
+        )
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(
+            os.path.exists(db_path),
+            msg="编码失败不能创建原本不存在的数据库文件",
+        )
+        return result
+
+    def test_invalid_utf8_positions_are_rejected(self):
+        """文件开头、字符串中间、合法 JSON 末尾的非法字节得到同类结果。"""
+        valid_prefix = '{"number": "Q-UTF8-BAD", "customer": "演示客户", "items": [{"description": "'
+        valid_suffix = '", "quantity": 2, "unit_price": 1250}]}'
+        cases = [
+            ("开头FF", b"\xff" + (valid_prefix + "咨询" + valid_suffix).encode("utf-8")),
+            ("字符串中间FF", (valid_prefix).encode("utf-8") + b"\xff" + ("咨询" + valid_suffix).encode("utf-8")),
+            ("末尾缺末字节E4B8", (valid_prefix + "咨询" + valid_suffix).encode("utf-8") + b"\xe4\xb8"),
+        ]
+        for index, (label, data) in enumerate(cases):
+            with self.subTest(样例=label):
+                input_path = self.write_bytes(data, name=f"bad-{index}.json")
+                db_path = os.path.join(self.workdir, f"utf8-{index}.sqlite")
+                self.assert_utf8_rejected(input_path, db_path)
+                with open(input_path, "rb") as f:
+                    self.assertEqual(f.read(), data, "输入文件字节内容不得改变")
+
+    def test_path_with_spaces_and_chinese_shown_verbatim(self):
+        input_path = self.write_bytes(b"\xff", name="错误 样例.json")
+        db_path = os.path.join(self.workdir, "utf8.sqlite")
+        self.assert_utf8_rejected(input_path, db_path)
+
+    def test_encoding_error_precedes_database_error(self):
+        """--db 指向不存在的父目录时，仍报告编码错误而非数据库错误。"""
+        input_path = self.write_bytes(b"\xff")
+        db_path = os.path.join(self.workdir, "no-such-dir", "db.sqlite")
+        self.assert_utf8_rejected(input_path, db_path)
+
+    def test_rejected_save_leaves_existing_database_untouched(self):
+        db_path = os.path.join(self.workdir, "existing.sqlite")
+        good_input = os.path.join(self.workdir, "good.json")
+        with open(good_input, "w", encoding="utf-8") as f:
+            json.dump(make_payload([make_item("咨询", 2, 1250)], number="Q-KEEP-UTF8"),
+                      f, ensure_ascii=False)
+        setup_result = self.run_quote("save", "--db", db_path, "--input", good_input)
+        self.assertEqual(setup_result.returncode, 0, msg=setup_result.stderr)
+
+        bad_input = self.write_bytes(b"\xff")
+        result = self.run_quote("save", "--db", db_path, "--input", bad_input)
+        self.assertEqual(result.returncode, 1, msg=result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        conn = sqlite3.connect(db_path)
+        try:
+            quotes = conn.execute(
+                "SELECT number, customer, total FROM quotes ORDER BY number"
+            ).fetchall()
+            items = conn.execute(
+                "SELECT quote_number, position, description, quantity, "
+                "unit_price, line_amount FROM items ORDER BY quote_number, position"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(quotes, [("Q-KEEP-UTF8", "演示客户", 2500)])
+        self.assertEqual(items, [("Q-KEEP-UTF8", 0, "咨询", 2, 1250, 2500)])
+
+    def test_valid_utf8_flow_unchanged(self):
+        """合法 UTF-8 合成报价：保存与预览行为与既有约定一致。"""
+        payload = make_payload(
+            [make_item("咨询", 2, 1250)],
+            number="Q-UTF8-001",
+            customer="演示客户<甲>&乙",
+        )
+        input_path = os.path.join(self.workdir, "input.json")
+        with open(input_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        db_path = os.path.join(self.workdir, "quotes.sqlite")
+
+        save_result = self.run_quote("save", "--db", db_path, "--input", input_path)
+        self.assertEqual(save_result.returncode, 0, msg=save_result.stderr)
+        self.assertEqual(save_result.stdout.strip(), "Q-UTF8-001")
+
+        output_path = os.path.join(self.workdir, "preview.html")
+        preview_result = self.run_quote(
+            "preview", "--db", db_path, "--number", "Q-UTF8-001", "--output", output_path
+        )
+        self.assertEqual(preview_result.returncode, 0, msg=preview_result.stderr)
+        with open(output_path, encoding="utf-8") as f:
+            document = f.read()
+        self.assertIn('<td class="num">12.50</td>', document, "单价应显示 12.50 元")
+        self.assertIn('<td class="num">25.00</td>', document, "行金额应显示 25.00 元")
+        self.assertIn("演示客户&lt;甲&gt;&amp;乙", document, "客户文字应正确转义")
+
+    def test_valid_utf8_but_invalid_json_keeps_parse_error(self):
+        input_path = os.path.join(self.workdir, "broken.json")
+        with open(input_path, "w", encoding="utf-8") as f:
+            f.write('{"number": "Q-UTF8-002", ')
+        db_path = os.path.join(self.workdir, "json.sqlite")
+        result = self.run_quote("save", "--db", db_path, "--input", input_path)
+        self.assertEqual(result.returncode, 1, msg=result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertTrue(
+            result.stderr.startswith("错误: JSON 解析失败:"),
+            msg=f"JSON 语法错误应保留解析失败前缀，实际：{result.stderr!r}",
+        )
+        self.assertFalse(os.path.exists(db_path))
+
+
 if __name__ == "__main__":
     unittest.main()
