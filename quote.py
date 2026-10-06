@@ -312,12 +312,31 @@ def cmd_preview(args):
     # O_EXCL 兜底：即使并发出现同名文件也不覆盖。
     try:
         fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        try:
-            os.write(fd, document.encode("utf-8"))
-        finally:
-            os.close(fd)
     except OSError as exc:
         return fail(f"无法写入输出文件 {args.output}: {exc}")
+
+    # os.write 一次可能只接受部分字节：循环写剩余内容，直到整份文档写出。
+    # 返回 0 字节表示写入未取得进展，按失败结束而不是空转；写入或关闭
+    # 抛出 OSError 时同样以失败结束，目标里可能保留此前已写出的部分内容。
+    error = None
+    try:
+        view = memoryview(document.encode("utf-8"))
+        while view:
+            written = os.write(fd, view)
+            if written == 0:
+                error = "写入未取得进展（write 返回 0 字节）"
+                break
+            view = view[written:]
+    except OSError as exc:
+        error = str(exc)
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            if error is None:
+                error = str(exc)
+    if error is not None:
+        return fail(f"无法写入输出文件 {args.output}: {error}")
 
     print(args.output)
     return 0
