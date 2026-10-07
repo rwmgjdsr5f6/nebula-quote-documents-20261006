@@ -124,6 +124,15 @@ def extract_body_rows(document):
     return re.findall(r"<tr>.*?</tr>", match.group(1), flags=re.S)
 
 
+def extract_total_row(document):
+    """取出 tfoot 内唯一的合计行，返回其三个单元格文本。"""
+    match = re.search(r"<tfoot>(.*?)</tfoot>", document, flags=re.S)
+    assert match is not None, "HTML 必须包含 <tfoot> 合计行"
+    rows = re.findall(r"<tr>.*?</tr>", match.group(1), flags=re.S)
+    assert len(rows) == 1, "tfoot 内应只有一行合计"
+    return cells_of(rows[0])
+
+
 def cells_of(row):
     return re.findall(r"<td[^>]*>(.*?)</td>", row, flags=re.S)
 
@@ -341,6 +350,131 @@ class ReportHtmlBigTotalTestCase(ReportHtmlTestBase):
             f"{2 * INT64_MAX // 100}.{2 * INT64_MAX % 100:02d}",
         )
         self.assertIn("184467440737095516.14", document)
+
+
+class ReportHtmlTotalRowTestCase(ReportHtmlTestBase):
+    """合计行：位于全部客户行之后的 tfoot，三列，只覆盖本次筛选命中。"""
+
+    # 任务验收样例：Q-A/Q-B 客户“演示甲”（2800 分与 0 分），Q-C 客户“演示乙”（300 分）。
+    TOTAL_SAMPLES = [
+        {
+            "number": "Q-A",
+            "customer": "演示甲",
+            "note": "演示",
+            "items": [{"description": "演示", "quantity": 1, "unit_price": 2800}],
+        },
+        {
+            "number": "Q-B",
+            "customer": "演示甲",
+            "note": "演示",
+            "items": [{"description": "演示", "quantity": 1, "unit_price": 0}],
+        },
+        {
+            "number": "Q-C",
+            "customer": "演示乙",
+            "note": "演示",
+            "items": [{"description": "演示", "quantity": 1, "unit_price": 300}],
+        },
+    ]
+
+    def test_total_row_sums_all_customers(self):
+        self.save_all(self.TOTAL_SAMPLES)
+        result = self.report_html("quotes.sqlite", "all.html")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, "all.html\n")
+        _, document = self.read_output("all.html")
+
+        rows = extract_body_rows(document)
+        self.assertEqual(len(rows), 2, msg="客户行保持原有分组，不含合计")
+        # 合计行在 tfoot：三列，张数 3（零金额报价也计数），金额 31.00。
+        self.assertEqual(extract_total_row(document), ["合计", "3", "31.00"])
+        # tfoot 位于 tbody 之后。
+        self.assertLess(document.index("</tbody>"), document.index("<tfoot>"))
+
+    def test_total_row_covers_only_filtered_quotes(self):
+        self.save_all(self.TOTAL_SAMPLES)
+        result = self.report_html("quotes.sqlite", "selected.html",
+                                  "--customer", "演示甲")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        _, document = self.read_output("selected.html")
+
+        rows = extract_body_rows(document)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(cells_of(rows[0]), ["演示甲", "2", "28.00"])
+        self.assertEqual(extract_total_row(document), ["合计", "2", "28.00"])
+
+    def test_total_row_present_when_empty(self):
+        db_path = os.path.join(self.workdir, "empty.sqlite")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(FULL_SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = self.report_html("empty.sqlite")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        _, document = self.read_output()
+
+        self.assertEqual(extract_body_rows(document), [])
+        self.assertIn(EMPTY_NOTICE, document)
+        self.assertIn("<th>客户</th>", document)
+        self.assertEqual(extract_total_row(document), ["合计", "0", "0.00"])
+
+    def test_total_row_present_when_filter_misses(self):
+        self.save_all(self.TOTAL_SAMPLES)
+        result = self.report_html("quotes.sqlite", "miss.html",
+                                  "--customer", "无此客户")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        _, document = self.read_output("miss.html")
+        self.assertEqual(extract_body_rows(document), [])
+        self.assertIn(EMPTY_NOTICE, document)
+        self.assertEqual(extract_total_row(document), ["合计", "0", "0.00"])
+
+    def test_customer_named_total_not_replaced(self):
+        """客户原文就是“合计”：仍单独成行，tfoot 合计行另算。"""
+        self.save_sample(
+            {
+                "number": "Q-HEJI",
+                "customer": "合计",
+                "items": [{"description": "x", "quantity": 1, "unit_price": 500}],
+            },
+            0,
+        )
+        result = self.report_html("quotes.sqlite")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        _, document = self.read_output()
+
+        rows = extract_body_rows(document)
+        self.assertEqual(len(rows), 1, msg="名为“合计”的客户仍是普通数据行")
+        self.assertEqual(cells_of(rows[0]), ["合计", "1", "5.00"])
+        self.assertEqual(extract_total_row(document), ["合计", "1", "5.00"])
+        # 两个“合计”单元格分处 tbody 与 tfoot，互不替换。
+        self.assertEqual(document.count("<td>合计</td>"), 2)
+
+    def test_total_row_beyond_int64_is_exact(self):
+        customer = "大额客户"
+        for index in range(2):
+            self.save_sample(
+                {
+                    "number": f"Q-HUGE-{index}",
+                    "customer": customer,
+                    "items": [
+                        {"description": "上限单价", "quantity": 1,
+                         "unit_price": INT64_MAX}
+                    ],
+                },
+                index,
+            )
+        result = self.report_html("quotes.sqlite")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        _, document = self.read_output()
+        # 2 * INT64_MAX = 18446744073709551614 分 -> 184467440737095516.14 元。
+        self.assertEqual(
+            extract_total_row(document),
+            ["合计", "2", "184467440737095516.14"],
+        )
 
 
 class ReportHtmlLegacyTestCase(ReportHtmlTestBase):
