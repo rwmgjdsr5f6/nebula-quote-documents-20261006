@@ -265,6 +265,9 @@ def render_html(number, customer, note, items, total):
         "</tr>"
         for position, (description, quantity, unit_price, line_amount) in enumerate(items)
     )
+    # 编号、客户（dl dd）与明细说明（tbody 第 2 列）以 pre-wrap 呈现：
+    # 首尾空格、连续空格与换行按原样显示，连续换行保留空行；多行客户仍在
+    # 客户信息区域，多行说明仍属于同一行明细。文本仍整体 HTML 转义。
     # 有说明时在客户信息之后、明细表格之前展示；pre-wrap 保留空格与换行。
     # 无说明时不出现该区域，页面其余内容与样式与原先逐字节一致。
     note_style = ""
@@ -287,7 +290,9 @@ def render_html(number, customer, note, items, total):
   table {{ border-collapse: collapse; margin-top: 1em; }}
   th, td {{ border: 1px solid #999; padding: 0.4em 0.8em; }}
   .num {{ text-align: right; white-space: nowrap; }}
-  tfoot td {{ font-weight: bold; }}{note_style}
+  tfoot td {{ font-weight: bold; }}
+  dl dd {{ white-space: pre-wrap; }}
+  tbody td:nth-child(2) {{ white-space: pre-wrap; }}{note_style}
 </style>
 </head>
 <body>
