@@ -1,0 +1,495 @@
+客户报价汇总（report）张数、累计金额与 HTML 合计行来源说明
+=============================================================
+
+核对基准
+--------
+- 产品源码：quote.py（仓库根目录，唯一可执行源码，当前全文 762 行）。
+- 公开文档：README.md“按客户汇总报表”一节（README.md:105-135）。
+- 回归测试：tests/ 下与 report 直接相关的三个文件——
+  tests/test_report_flow.py（JSON 形式、分组排序、旧库、超大累计、读库失败）、
+  tests/test_report_html_flow.py（HTML 形式、空态、筛选、转义、失败路径）、
+  tests/test_report_total_flow.py（HTML 合计行与“合计”客户行的区分）。
+- 本次核对实际运行 python3 -m unittest discover -s tests：122 个用例全部通过
+  （耗时约 42 秒）。本说明所有行号均以当前 quote.py 为准。
+
+证据分级（严格区分三类结论，不混用）
+  【源码】由当前 quote.py 源码直接推导，标注函数名与行号。
+  【测试】已有回归测试中的断言，标注测试文件与行号；通过情况以上述本次实跑为准。
+  【样例】本文档第七节三张合成报价（Q-R1/Q-R2/Q-R3）的输入、命令与确定预期。
+          该样例已在本次核对时于仓库外临时目录（/tmp/quote-doc-qaOs8K，
+          Linux + Python 3 标准库 sqlite3）按文档命令实际执行，凡引用其
+          实际输出处标【实测】；未实际执行的内容一律不写成实测。
+  本次交付只新增本文档，不修改 quote.py、README.md、测试与任何数据格式；
+  save / preview / list / export / report 的既有命令与行为均保持不变。
+
+
+一、公开入口与“读库 -> 精确筛选 -> 分组 -> 排序 -> 输出”的顺序
+---------------------------------------------------------------
+
+公开命令（README.md:107-110）：
+
+  python3 quote.py report --db demo.sqlite
+  python3 quote.py report --db demo.sqlite --customer 演示客户 --output report.html
+
+省略 --output 时输出一行 JSON 到标准输出；带 --output 时生成离线 HTML，
+标准输出仅回显输出路径。
+
+入口与处理位置【源码】：
+
+  report 子命令参数定义      build_parser()   quote.py:736-750
+    --db（必填）、--customer（默认 None）、--output（默认 None）
+  分发到处理函数              main()           quote.py:755-758
+  report 处理函数            cmd_report()     quote.py:619-697
+  只读打开数据库              open_readonly_database()  quote.py:212-217
+  HTML 渲染                  render_report_html()      quote.py:554-616
+  独占新建输出文件            write_new_file()          quote.py:320-349
+  分->元格式                  format_yuan()             quote.py:251-253
+  统一失败出口                fail()                    quote.py:51-54
+
+cmd_report() 内部的固定顺序（quote.py:619-697）【源码】：
+
+  1. 空白客户筛选值拒绝        quote.py:622-624（在读库与建文件之前）
+  2. --output 目标已存在拒绝   quote.py:627-629（同样在读库之前）
+  3. 以只读 URI 打开数据库     quote.py:633；open_readonly_database() 拼
+                               file:<绝对路径>?mode=ro（quote.py:214-215），
+                               数据库不存在也不会创建任何文件
+  4. 校验 quotes 表及必要列    quote.py:638-646（只需 number/customer/total）
+  5. 读库：一张报价只取一行    SELECT customer, total FROM quotes（quote.py:649）
+  6. Python 中逐行精确筛选     quote.py:660-664（见第九节）
+  7. Python 中按客户分组累计   quote.py:659-666（见第二、三节）
+  8. 按客户原文 UTF-8 字节排序 quote.py:670-675（见第六节）
+  9. 输出：JSON 走 quote.py:677-686；HTML 先 render_report_html（688 行调用）
+     再 write_new_file 落盘（quote.py:692-694），成功后 print 路径（quote.py:696）
+
+  任何 sqlite3.Error 都在 quote.py:652-653 收口为
+  “错误: 无法读取数据库 <路径>: <原因>”，退出码 1（见第十二节）。
+
+
+二、客户报价张数（quote_count）从哪来
+--------------------------------------
+
+结论：张数 = 分组命中的 quotes 主表行数；每张报价无论有多少条明细都计 1，
+零金额报价也计 1。
+
+【源码】
+- 读库语句只查主表：“SELECT customer, total FROM quotes”（quote.py:649），
+  完全不读取 items 表。源码注释明确“每张报价只取一行，含多条明细也不会
+  重复计数”（quote.py:647-648）。
+- 分组循环对每个命中的主表行无条件把计数加 1（quote.py:665-666）：
+      count, subtotal = groups.get(customer, (0, 0))
+      groups[customer] = (count + 1, subtotal + total)
+  计数 +1 不以金额是否为 0 为条件，故 unit_price 为 0 的合法报价照样计张数；
+  零单价为 save 规则允许（unit_price >= 0，quote.py:120-124）。
+
+【测试】
+- 多条明细不增加张数：Q-B 含两条明细，前置断言库中 items 确有 2 行
+  （tests/test_report_flow.py:175-183），报表中 Demo 组 quote_count 仍为 2
+  且断言“多明细报价只计一张”（tests/test_report_flow.py:222-225）；
+  HTML 侧同样断言 Q-MIXED 两条明细只计 1
+  （tests/test_report_html_flow.py:204-212）。
+- 零金额仍计数：零金额 Q-A 与多明细 Q-B 同组，2 张、累计 2500
+  （tests/test_report_flow.py:64-70、222-225）；
+  tests/test_report_total_flow.py:289-296 断言筛选后 2 张中包含
+  零金额的 Q-TOTAL-2。
+
+
+三、客户累计金额（total）从哪来
+--------------------------------
+
+结论：累计金额直接读取 quotes.total 这一“保存时已落库的报价合计”，逐张相加；
+报表不重新计算明细，求和在 Python 中进行，可超出有符号 64 位上限。
+
+【源码】
+- 读取的就是 total 列（quote.py:649），SQL 中没有 JOIN items、没有
+  quantity*unit_price 之类的重算。
+- 分组内做 Python 整数加法 subtotal + total（quote.py:666）。注释说明
+  刻意不用 SQLite 的 SUM：SUM 受有符号 64 位整数限制，而多张合法报价的
+  累计可能越界；Python 整数可精确表示任意大合计（quote.py:655-658）。
+- total 本身的来路（供溯源）：save 时 validate_quote() 以
+  行金额 = quantity * unit_price（quote.py:129）、total = 各行之和
+  （quote.py:135）计算，并随主行 INSERT 落库（quote.py:187-190）。
+  report 是这一已存值的纯读取方。
+
+【测试】
+- “读已存 total、不重算”的直接证据：保存后手工把 Q-MIXED 的 total 篡改为
+  9999，HTML 客户行金额即显示 99.99，而不是按明细重算的 28.00
+  （tests/test_report_html_flow.py:186-202）。
+- 大整数精确：两张 INT64_MAX 分报价同组，JSON total 精确等于
+  18446744073709551614 且原文数字出现在输出中
+  （tests/test_report_flow.py:341-371）；HTML 见第十一节。
+
+
+四、HTML 合计行（tfoot）从哪来；名为“合计”的客户仍是独立客户行
+-----------------------------------------------------------------
+
+结论：HTML 最后一行“合计”不是某个客户，而是对本次结果（经筛选、分组后
+records 中各组）再求一次张数之和与金额之和；客户原文即使就是“合计”，
+也仍是 tbody 中一个独立的普通客户行，两者不互换、不合并。
+
+【源码：render_report_html() quote.py:554-616】
+- 客户行由 records 渲染进 <tbody>（quote.py:566-575），每行三格：
+  转义后的客户原文、张数、format_yuan(subtotal)（quote.py:567-573）。
+- 合计行单独渲染进 <tfoot>（quote.py:585-591）：
+      total_count  = sum(count ...)      quote.py:583
+      total_amount = sum(subtotal ...)   quote.py:584
+  即合计只统计本次 records——筛选命中后、分组后的结果，不含未命中客户。
+- 空记录时 tbody 为空并显示“没有匹配的报价”（quote.py:577-579），
+  而 tfoot 仍渲染；sum 对空序列得 0，format_yuan(0) = "0.00"
+  （format_yuan quote.py:251-253），故空态合计行为 0 张、0.00 元。
+- 函数文档字符串明确：合计行固定在 tfoot；客户原文就是“合计”时仍作为
+  tbody 独立客户行，不会被替换（quote.py:560-564）。
+- 金额换算 format_yuan(cents) = f"{cents // 100}.{cents % 100:02d}"
+  （quote.py:251-253），纯整数 //100 与 %100 两位补零，无浮点；
+  客户累计在 quote.py:571 调用、合计金额在 quote.py:589 调用。
+- 页面 <title> 与 <h1> 均为“客户报价汇总”（quote.py:596、608），
+  表头三列“客户 / 报价张数 / 累计金额（元）”（quote.py:611）。
+
+【测试】
+- 无筛选时 tbody 两个客户行（合计客户 1 张 7.00；演示客户 2 张 28.00），
+  tfoot 唯一合计行 3 张 35.00，且 </tbody> 位于 <tfoot> 之前、
+  tbody 中恰有一个 <td>合计</td> 客户行、全页只有一个 tfoot
+  （tests/test_report_total_flow.py:208-252；期望常量见
+  tests/test_report_total_flow.py:63-67）。
+- 合计恒等：合计行张数/金额分别等于各客户行之和
+  （tests/test_report_total_flow.py:258-270）。
+- 筛选后合计行随结果收窄为 2 张、28.00，且未命中的“合计”客户不出现
+  （tests/test_report_total_flow.py:278-311）。
+- 空库/无匹配时合计行为 [合计, 0, 0.00]（tests/test_report_total_flow.py:
+  314-358）。
+
+
+五、JSON 形式不增加全局合计对象
+--------------------------------
+
+结论：省略 --output 时，标准输出只是“每个客户一个对象”的数组，
+没有、也不会追加任何全局合计对象；全局合计仅存在于 HTML 的 tfoot。
+
+【源码】payload 由 records 直接列表推导，对象字段固定为
+customer / quote_count / total（quote.py:681-684），随后
+sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+（quote.py:685）。records 之外没有任何汇总元素参与输出。
+张数与累计均为 JSON 整数（分单位），不换算为元、浮点或字符串；
+ensure_ascii=False 保留客户原文，json.dumps 只做 JSON 所需转义
+（引号、换行等），不做 HTML 转义（quote.py:677-685 注释）。
+
+【测试】三张样例下 JSON 恰为两个客户对象（合计客户 700、演示客户 2800），
+无第三个对象；每个对象只有三个键、total 是 int 且不是 bool；
+原文“演示<甲>&乙”裸出现在 stdout，且不生成任何 HTML
+（tests/test_report_total_flow.py:417-447）。
+字段白名单与整数类型另有 tests/test_report_flow.py:210-220 覆盖。
+
+
+六、客户排序与文本转义
+----------------------
+
+排序【源码】：
+- records 按 sorted(groups.items(), key=lambda item: item[0].encode("utf-8"))
+  排列（quote.py:670-675），即以客户原文的 UTF-8 字节升序，源码注释说明
+  这等价于 SQLite TEXT 的 BINARY 排序，与报价保存顺序无关
+  （quote.py:668-669）。
+- 本文样例中：“合计”首字“合”(U+5408) 的 UTF-8 首字节为 E5，
+  “演示<甲>&乙”首字“演”(U+6F14) 首字节为 E6，E5 < E6，
+  故“合计”客户排在前面。
+  【测试】同样的 BINARY 序断言见 tests/test_report_flow.py:64-70、204-208
+  （空格 < 大写 < 小写）与 tests/test_report_total_flow.py:61-66。
+
+HTML 转义【源码】：
+- render_report_html 内 e = html.escape（quote.py:565），客户文本经
+  e(customer) 放入单元格（quote.py:569）：< 变 &lt;、> 变 &gt;、
+  & 变 &amp;，浏览器中仍显示原文，不产生标签或脚本。
+- 单元格样式为 white-space: pre-wrap（quote.py:602），首尾空格、连续空格
+  与换行可见，多行客户仍属同一行。
+【测试】“演示&lt;甲&gt;&amp;乙”出现而裸串“演示<甲>&乙”不出现
+（tests/test_report_total_flow.py:254-256）；含空格/换行客户逐字符保留
+（tests/test_report_html_flow.py:261-288）；<script> 只被转义、
+tbody 中除 tr/td 外无客户引入的标签（tests/test_report_html_flow.py:469-488）。
+
+JSON 不做 HTML 转义【源码：quote.py:685】，【测试】原文 <、& 直接出现
+（tests/test_report_total_flow.py:442-443）。
+
+
+七、三张合成报价贯穿样例（Q-R1 / Q-R2 / Q-R3）
+-----------------------------------------------
+
+样例设计（均为 save 规则下的合法输入，金额单位为分）：
+  Q-R1  客户“演示<甲>&乙”，两条明细：数量 2 单价 1250、数量 1 单价 300
+        -> 保存合计 2×1250 + 1×300 = 2800 分（validate_quote quote.py:129、135）
+  Q-R2  同一客户“演示<甲>&乙”，一条明细：数量 1 单价 0
+        -> 合计 0 分；零金额合法（quote.py:120-124），仍计 1 张
+  Q-R3  客户原文就是“合计”，一条明细：数量 1 单价 700 -> 合计 700 分
+
+7.1 可供现有 save 直接使用的完整 JSON 输入（UTF-8 文件内容）
+
+q-r1.json：
+
+{
+  "number": "Q-R1",
+  "customer": "演示<甲>&乙",
+  "items": [
+    {"description": "咨询", "quantity": 2, "unit_price": 1250},
+    {"description": "资料", "quantity": 1, "unit_price": 300}
+  ]
+}
+
+q-r2.json：
+
+{
+  "number": "Q-R2",
+  "customer": "演示<甲>&乙",
+  "items": [
+    {"description": "赠品", "quantity": 1, "unit_price": 0}
+  ]
+}
+
+q-r3.json：
+
+{
+  "number": "Q-R3",
+  "customer": "合计",
+  "items": [
+    {"description": "服务", "quantity": 1, "unit_price": 700}
+  ]
+}
+
+保存命令（在仓库根目录；数据库与 JSON 路径可任指空目录，行为同
+README.md:9-11 的 save）：
+
+  python3 quote.py save --db demo.sqlite --input q-r1.json
+  python3 quote.py save --db demo.sqlite --input q-r2.json
+  python3 quote.py save --db demo.sqlite --input q-r3.json
+
+【实测】三次保存退出码均为 0，标准输出依次为 Q-R1、Q-R2、Q-R3（各带换行），
+标准错误为空；保存顺序故意为 R1、R2、R3，报表顺序与该先后无关（见第六节）。
+
+7.2 无筛选 JSON（文档要求的第一条 report 命令）
+
+  python3 quote.py report --db demo.sqlite
+
+【样例】预期标准输出为单行 JSON 数组加一个换行（客户按 BINARY 升序，
+分单位整数；尖括号与与号保持原文，不做 HTML 转义）：
+
+[{"customer": "合计", "quote_count": 1, "total": 700}, {"customer": "演示<甲>&乙", "quote_count": 2, "total": 2800}]
+
+（行末另有一个 "\n"。）
+读法对照：
+  - “合计”客户 1 张（仅 Q-R3）、累计 700 分；
+  - “演示<甲>&乙”客户 2 张（Q-R1 两条明细只算 1 张，Q-R2 零金额也算 1 张）、
+    累计 2800 + 0 = 2800 分，读取的是两张报价已存 total（quote.py:649、666）；
+  - 数组到此结束，没有第三个全局合计对象（quote.py:681-685）。
+【实测】本次实跑输出与上串逐字节一致（od 核对末三字节为 } ] \n）。
+【测试】同结构（测试中编号为 Q-TOTAL-*）断言见
+tests/test_report_total_flow.py:420-447。
+
+7.3 无筛选 HTML（用于核对 3 张 35.00 元合计行）
+
+  python3 quote.py report --db demo.sqlite --output report.html
+
+成功时退出码 0、标准错误为空，标准输出仅为 report.html 加一个换行
+（quote.py:696）。
+【样例】确定结果（【实测】生成文件中的逐字行）：
+
+  <thead>：
+    <tr><th>客户</th><th>报价张数</th><th>累计金额（元）</th></tr>
+  <tbody>（两行，BINARY 序；客户原文“合计”是独立客户行）：
+    <tr><td>合计</td><td class="num">1</td><td class="num">7.00</td></tr>
+    <tr><td>演示&lt;甲&gt;&amp;乙</td><td class="num">2</td><td class="num">28.00</td></tr>
+  <tfoot>（所有客户行之后的唯一合计行）：
+    <tr><td>合计</td><td class="num">3</td><td class="num">35.00</td></tr>
+
+  - 演示客户的尖括号与与号转义为 &lt; &gt; &amp;，页面显示仍为原文
+    （quote.py:569）；
+  - 合计行 3 张 = 1+2，35.00 元 = 700+2800+0（=3500 分，format_yuan
+    得 35.00；quote.py:583-589、251-253），零金额的 Q-R2 计入张数也计入
+    金额（加 0）；
+  - 名为“合计”的客户行在 tbody，汇总行在 tfoot，二者并存且 tfoot 在
+    tbody 之后（quote.py:566-591）。
+【测试】tests/test_report_total_flow.py:208-270 对同样布局、顺序与
+恒等关系做了完整断言。
+
+7.4 精确筛选“演示<甲>&乙”的 HTML（文档要求的第二条 report 命令）
+
+  python3 quote.py report --db demo.sqlite --customer '演示<甲>&乙' --output filtered.html
+
+（命令行用单引号包住含 < 与 & 的客户原文；筛选值是 Python 字符串逐字符
+比较，不经过 shell 之外的任何归一化。）
+【样例】确定结果（【实测】生成文件中的逐字行）：
+
+  <tbody>（只有演示客户一个客户行；“合计”客户未命中，不出现）：
+    <tr><td>演示&lt;甲&gt;&amp;乙</td><td class="num">2</td><td class="num">28.00</td></tr>
+  <tfoot>（合计随筛选收窄，只覆盖命中的两张）：
+    <tr><td>合计</td><td class="num">2</td><td class="num">28.00</td></tr>
+
+  - 2 张 = Q-R1（两条明细不增加张数）+ Q-R2（零金额仍计数）；
+  - 28.00 元 = 2800 分（2800 + 0），不是 35.00：未命中的 Q-R3 不进合计
+    （合计只对筛选后的 records 求和，quote.py:583-584；筛选 quote.py:663）。
+【测试】tests/test_report_total_flow.py:278-311 断言筛选后恰为这一个
+客户行与 2 张 28.00 的合计行。
+
+
+八、空库或无匹配时的输出
+------------------------
+
+JSON 形式【源码】：groups 为空 -> records 为 [] -> 输出 "[]\n"
+（quote.py:670-685）。
+【实测】对建全表但无报价的数据库、以及 --customer 无此客户，
+标准输出均恰为 [] 加一个换行（3 字节）。
+【测试】tests/test_report_flow.py:242-261（空库 [ ]\n）、
+tests/test_report_html_flow.py:514-524。
+
+HTML 形式【源码】：records 为空时 tbody 为空并输出
+<p class="empty">没有匹配的报价</p>（quote.py:577-579），表头保留
+（thead 为固定模板 quote.py:609-612），tfoot 合计行为 0 张、0.00 元
+（quote.py:583-591 对空 records 求和为 0，format_yuan(0) 见 251-253）。
+【实测】无匹配 HTML 中无任何 tbody 客户行，提示语存在，tfoot 行为
+    <tr><td>合计</td><td class="num">0</td><td class="num">0.00</td></tr>
+【测试】tests/test_report_html_flow.py:215-245（空库与无匹配均保留表头、
+显示提示）、tests/test_report_total_flow.py:314-358（合计 0 张 0.00）。
+合法但无匹配的筛选是成功查询：退出码 0，不是错误
+（筛选只是让 records 为空，quote.py:660-666）。
+
+
+九、客户筛选是逐字符精确匹配
+----------------------------
+
+【源码】提供 --customer 时，在 Python 分组循环内以
+customer != customer_filter 跳过不等的主表行（quote.py:663），即 Python
+字符串逐字符相等才命中（dict 键也是精确相等，quote.py:665）。注释明确：
+大小写、首尾空格、连续空格与换行都参与比较，% 与 _ 按普通字符处理，
+不做子串搜索、LIKE 通配或任何归一化（quote.py:661-662、657-658）。
+注意筛选发生在读库之后（SQL 不带 WHERE，quote.py:649），但结果与
+“在库中精确过滤”等价；空白筛选值在更早阶段即被拒绝（见第十二节）。
+
+【测试】
+- 大小写、空格、换行：带首尾空格与换行的客户只有用同一原文筛选才命中，
+  单元格逐字符保留（tests/test_report_html_flow.py:261-288）。
+- % 与 _ 为普通字符：客户“100%_特价”只有用该原文才命中；用“100_特价”
+  筛选得到空结果与提示（tests/test_report_html_flow.py:290-312）。
+- 旧库中含 %、_、引号、换行的客户同样逐字符保留
+  （tests/test_report_flow.py:267-309）。
+
+
+十、旧库兼容：缺 note 列或 items 表仍可汇总
+-------------------------------------------
+
+【源码】报表只要求 quotes 表存在且含 number、customer、total 三列
+（quote.py:638-646）；SELECT 只取 customer、total（quote.py:649），
+note 列与 items 表从不参与。数据库以只读方式打开（quote.py:633、
+212-217），路径上没有 ALTER、CREATE 或任何写操作，因此不补表补列、
+不改记录。
+
+【测试】旧库（quotes 只有 number/customer/total 三列、无 items 表）
+可正常汇总且客户原文（含 % 与 _）逐字符保留；报表后 PRAGMA 列集合与
+sqlite_master 逐字节一致、报价行不变（tests/test_report_flow.py:264-335）；
+HTML 侧同样断言不补 note 列、不建 items 表
+（tests/test_report_html_flow.py:346-384）。
+【实测】手工构造的三列旧库 report 正常输出，报表后列仍为
+['number','customer','total']、表仍只有 quotes。
+（对比：save 侧才会为旧库补 note 列，ensure_schema quote.py:148-153；
+那是保存命令的既有行为，与 report 无关，本次均未改动。）
+
+
+十一、累计超出有符号 64 位上限仍精确保留整数
+---------------------------------------------
+
+【源码】INT64_MAX = (1<<63)-1 定义于 quote.py:22。report 的累计是
+Python 整数加法（quote.py:666），刻意绕开 SQLite SUM 的 64 位限制
+（注释 quote.py:655-658）；JSON 直接以整数输出（quote.py:681-685），
+HTML 以 format_yuan 对整值做 //100 与 %100（quote.py:251-253、571、589），
+全程无浮点、无科学计数法、无舍入。前提是每张报价本身在 save 时合法
+（单张 total 超 INT64_MAX 会被保存拒绝，validate_quote quote.py:135-137）；
+越界只可能出现在“多张合法报价的累计”。
+
+【样例/实测】同一客户两张单价 INT64_MAX（9223372036854775807）分的报价：
+  JSON：{"customer": "大额客户", "quote_count": 2, "total": 18446744073709551614}
+  HTML 客户行与合计行金额均含 184467440737095516.14（即 2×INT64_MAX 分，
+  18446744073709551614 //100=184467440737095516、%100=14）。
+【测试】JSON 精确值与原文数字 tests/test_report_flow.py:341-371；
+HTML 精确两位小数 tests/test_report_html_flow.py:315-343；
+两个不同客户各一张时合计仍精确 tests/test_report_total_flow.py:361-414。
+
+
+十二、失败路径（退出码、标准流、副作用）
+-----------------------------------------
+
+统一出口 fail(message)：向标准错误打印“错误: <原因>”，返回 1
+（quote.py:51-54）。argparse 参数层错误为退出码 2，不在此列。
+
+1) 空白客户筛选值【源码 quote.py:622-624】
+   --customer 为 "" 或纯空白（strip 后为空）时，在读库与创建输出之前
+   直接 fail("客户筛选值不能为空白")：退出 1、标准输出为空。
+   【实测】--customer '   ' -> rc=1，stdout 空，stderr
+   “错误: 客户筛选值不能为空白”，数据库与 HTML 均未被创建。
+   【测试】对 ""、" "、"\t"、" \n\t " 等逐个断言，且确认不创建输出、
+   不触碰数据库（tests/test_report_html_flow.py:407-424）。
+
+2) 数据库不存在 / 不可读 / 不是有效 SQLite / 缺必要表列
+   【源码 quote.py:632-653】
+   只读 URI 打开或后续 PRAGMA/SELECT 抛 sqlite3.Error 时，fail
+   “无法读取数据库 <路径>: <原因>”，退出 1、标准输出为空；
+   因 mode=ro 且路径不存在不建文件，失败不创建数据库或 HTML。
+   缺 quotes 表（PRAGMA 返回空列集，quote.py:640-641）或缺
+   number/customer/total 任一列（quote.py:642-646）同样如此。
+   【实测】
+     不存在 nope.sqlite -> “错误: 无法读取数据库 nope.sqlite:
+       unable to open database file”，文件未创建；
+     非 SQLite 文件 bad.bin -> “... bad.bin: file is not a database”，
+       未生成 HTML；
+   【测试】缺文件、非 SQLite 字节且逐字节保留、缺 quotes 表、
+   分别缺三列之一（tests/test_report_flow.py:374-459，错误格式助手
+   assert_report_error 在 139-164；HTML 侧 tests/test_report_html_flow.py:
+   426-458）。
+
+3) 输出文件已存在【源码 quote.py:627-629】
+   os.path.exists 命中即在读库之前 fail(“输出文件已存在: <路径>”)，
+   退出 1、标准输出为空；写入另有 O_EXCL 兜底（write_new_file
+   quote.py:320-349，调用点 692），绝不覆盖。
+   【实测】已存在 exists.html 内容为 MARKER，report 指向它 -> rc=1、
+   stdout 空、stderr“错误: 输出文件已存在: exists.html”，原文件仍为 MARKER。
+   【测试】tests/test_report_html_flow.py:390-405。
+   输出目录不存在等写入失败为“无法写入输出文件 <路径>: <原因>”
+   （quote.py:692-694；tests/test_report_html_flow.py:460-467）。
+
+失败检查的先后顺序（先拒绝者优先）：空白筛选（622-624）
+-> 输出已存在（627-629）-> 打开/读取数据库（632-653）-> 渲染 -> 落盘
+（688-694）。
+
+
+十三、README 与源码的对应
+-------------------------
+
+README.md:105-135 的“按客户汇总报表”与当前源码主线一致，逐条落点：
+
+- 两种输出形式（JSON 到 stdout；--output 生成 HTML 且 stdout 仅路径）
+  README.md:112-113 —— quote.py:677-686、688-696。
+- HTML 标题“客户报价汇总”、三列、客户 BINARY 升序
+  README.md:114-115 —— quote.py:596、608、611、670-675。
+- 合计行位于所有客户行之后、与名为“合计”的客户行区分、合计仅覆盖本次
+  筛选、每张计一次（零金额同样计数）、读已存 total 不重算、超 64 位精确、
+  空态 0 张 0.00 元  README.md:116-120 —— quote.py:649、660-666、
+  577-591、251-253、655-658。
+- JSON 每客户仅 customer/quote_count/total 三字段、整数分单位
+  README.md:121-122、129 —— quote.py:681-685。
+- 客户逐字符同组、% 与 _ 普通字符 README.md:123 —— quote.py:657-666。
+- HTML 转义 + pre-wrap README.md:124 —— quote.py:565、569、602。
+- JSON 按 BINARY 升序、只做 JSON 转义 README.md:125 —— quote.py:670-685。
+- 多明细不重复、零金额计数、累计以已存合计为准 README.md:126-127
+  —— quote.py:647-649、665-666。
+- HTML 两位小数与超界精确 README.md:128 —— quote.py:251-253、571、589。
+- 空库/无匹配 JSON 为 [] 加换行；HTML 保留表头与提示；旧库缺 note/items
+  可直接汇总不补结构 README.md:130 —— quote.py:577-579、638-649、
+  681-685。
+- 空白筛选、输出已存在、写失败、数据库失败的退出码与标准错误
+  README.md:131-135 —— quote.py:622-629、652-653、692-694、51-54。
+
+
+十四、本次交付边界
+------------------
+
+- 仅新增本文件 docs/customer-report-flow.txt；quote.py、README.md、
+  tests/ 与任何数据格式均未修改（交付前后 git 工作区对产品代码无差异）。
+- 未新增任何功能：save、preview、list、export、report 的命令行、
+  JSON/HTML 格式与保存、预览、列表、导出、汇总的既有行为全部保持原样。
+- 验收可按第七节三份 JSON 输入、三条 save 命令与三条 report 命令
+  （无筛选 JSON、无筛选 HTML、精确筛选“演示<甲>&乙”的 HTML）逐项复现，
+  并对照本文给出的确定输出与第二至六、十二节标注的 quote.py 函数/行号、
+  各 tests 断言位置核对。
