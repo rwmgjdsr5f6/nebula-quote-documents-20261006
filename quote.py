@@ -570,6 +570,96 @@ def cmd_export(args):
     return 0
 
 
+def validate_report_customer_filter(customer_filter):
+    """校验客户筛选值。
+
+    返回原值（含两端空白，供逐字符精确匹配）；空字符串或纯空白抛出
+    ValueError。纯字符串运算，不访问数据库、不创建任何文件。
+    """
+    if customer_filter is not None and not customer_filter.strip():
+        raise ValueError("客户筛选值不能为空白")
+    return customer_filter
+
+
+def summarize_quote_rows(rows, customer_filter=None):
+    """对读取出的 (customer, total) 行执行精确筛选、分组累计与排序。
+
+    这是报表统计口径的唯一规则来源，全部基于入参序列计算，不打开数据库、
+    不创建输出文件，可独立验证：
+      - 筛选：提供 customer_filter 时只保留客户原文与之逐字符相同的行，
+        大小写、首尾空格、连续空格与换行都参与比较，% 与 _ 按普通字符
+        处理，不做子串搜索、LIKE 通配或任何归一化；
+      - 分组：客户名逐字符相同才归入同一组（dict 键即精确相等）；
+      - 计数：每张报价（每个入参行）只计一次，零金额同样计数；
+      - 累计：直接累加库中已保存的 total（分单位整数），不重新计算明细；
+        整数加法在 Python 中进行，超出有符号 64 位上限仍精确；
+      - 排序：按客户原文的 UTF-8 字节升序，等价于 SQLite TEXT 的
+        BINARY 排序，与报价保存顺序无关。
+    返回 [(customer, count, subtotal_cents), ...]。
+    """
+    groups = {}
+    for customer, total in rows:
+        if customer_filter is not None and customer != customer_filter:
+            continue
+        count, subtotal = groups.get(customer, (0, 0))
+        groups[customer] = (count + 1, subtotal + total)
+
+    return [
+        (customer, count, subtotal)
+        for customer, (count, subtotal) in sorted(
+            groups.items(), key=lambda item: item[0].encode("utf-8")
+        )
+    ]
+
+
+def summarize_report_grand_total(records):
+    """对本次筛选分组后的 records 再求一次合计：(总张数, 总分单位金额)。
+
+    合计仅覆盖本次结果（records 中各组），不含未命中客户；空结果为
+    (0, 0)。Python 整数求和不受有符号 64 位限制。纯计算，不访问
+    数据库或文件。
+    """
+    total_count = sum(count for _, count, _ in records)
+    total_amount = sum(subtotal for _, _, subtotal in records)
+    return total_count, total_amount
+
+
+def render_report_json(records):
+    """渲染 report 的单行 JSON 文本（以换行结尾），不落盘。
+
+    每客户仅 customer、quote_count、total 三个字段，张数与累计均为
+    JSON 整数（分单位），不换算为元、浮点或字符串；ensure_ascii=False
+    保留客户原文，json.dumps 只做 JSON 所需转义（引号、换行等），
+    不做 HTML 转义。空结果为 "[]\n"。
+    """
+    payload = [
+        {"customer": customer, "quote_count": count, "total": subtotal}
+        for customer, count, subtotal in records
+    ]
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def read_report_rows(conn):
+    """只读校验 quotes 表必要列并读取报表所需的 (customer, total) 行。
+
+    报表只需要 number、customer、total 三列；旧库缺 note 列不影响，
+    不补列、不改动已有数据；items 表不参与汇总，无需存在。缺 quotes
+    表或必要列、文件不是有效 SQLite 等都抛出 sqlite3.Error。累计以
+    已保存的报价合计为准，直接读取 total，不 JOIN items、不重新计算
+    明细；每张报价只取一行，含多条明细也不会重复计数。
+    """
+    quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+    required_columns = {"number", "customer", "total"}
+    if not quote_columns:
+        raise sqlite3.Error("缺少 quotes 表")
+    if not required_columns <= quote_columns:
+        raise sqlite3.Error(
+            "quotes 表缺少必要列: "
+            + ", ".join(sorted(required_columns - quote_columns))
+        )
+    return conn.execute("SELECT customer, total FROM quotes").fetchall()
+
+
 def render_report_html(records):
     """渲染客户汇总离线 HTML：records 为 (customer, count, subtotal_cents)。
 
@@ -599,8 +689,7 @@ def render_report_html(records):
 
     # 合计只统计 records（即本次筛选命中后分组的结果）：张数为各组张数之和，
     # 金额为各组累计之和。Python 整数不受有符号 64 位限制，超出仍精确。
-    total_count = sum(count for _, count, _ in records)
-    total_amount = sum(subtotal for _, _, subtotal in records)
+    total_count, total_amount = summarize_report_grand_total(records)
     total_block = (
         "  <tfoot>\n"
         '    <tr><td>合计</td>'
@@ -636,11 +725,16 @@ def render_report_html(records):
 
 
 def cmd_report(args):
+    # 本函数只做流程编排与失败收口；客户筛选、分组累计与排序的规则在
+    # summarize_quote_rows 等纯函数中，数据库访问在 read_report_rows 中，
+    # 输出渲染在 render_report_json / render_report_html 中。
+
     # 客户筛选值在访问数据库与创建输出文件前校验：空字符串或纯空白直接拒绝；
     # 含有效文字时保留两端空白，原样参与精确匹配。
-    customer_filter = args.customer
-    if customer_filter is not None and not customer_filter.strip():
-        return fail("客户筛选值不能为空白")
+    try:
+        customer_filter = validate_report_customer_filter(args.customer)
+    except ValueError as exc:
+        return fail(str(exc))
 
     # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
     output = args.output
@@ -651,57 +745,21 @@ def cmd_report(args):
     try:
         conn = open_readonly_database(args.db)
         try:
-            # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
-            # 报表只需要 number、customer、total 三列；旧库缺 note 列不影响，
-            # 不补列、不改动已有数据；items 表不参与汇总，无需存在。
-            quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
-            required_columns = {"number", "customer", "total"}
-            if not quote_columns:
-                raise sqlite3.Error("缺少 quotes 表")
-            if not required_columns <= quote_columns:
-                raise sqlite3.Error(
-                    "quotes 表缺少必要列: "
-                    + ", ".join(sorted(required_columns - quote_columns))
-                )
-            # 累计以已保存的报价合计为准，直接读取 total，不重新计算明细；
-            # 每张报价只取一行，含多条明细也不会重复计数。
-            rows = conn.execute("SELECT customer, total FROM quotes").fetchall()
+            # 缺表、缺列或文件不是有效 SQLite 都在 read_report_rows 中
+            # 抛出 sqlite3.Error。
+            rows = read_report_rows(conn)
         finally:
             conn.close()
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
-    # 在 Python 中分组累计：SQLite 的 SUM 受有符号 64 位整数限制，多张合法
-    # 报价的累计可能超出该范围，Python 整数可以精确表示任意大的合计。
-    # 客户名逐字符相同才归入同一组（dict 键即精确相等）：大小写、首尾空格、
-    # 连续空格与换行都参与比较，% 与 _ 按普通字符处理，不做任何归一化。
-    groups = {}
-    for customer, total in rows:
-        # 提供筛选值时只统计客户原文逐字符相同的报价（Python 字符串精确相等）：
-        # 大小写、首尾空格、连续空格与换行都参与比较，% 与 _ 按普通字符处理。
-        if customer_filter is not None and customer != customer_filter:
-            continue
-        count, subtotal = groups.get(customer, (0, 0))
-        groups[customer] = (count + 1, subtotal + total)
-
-    # 按客户原文的 UTF-8 字节升序排列，等价于 SQLite BINARY 排序，
-    # 与报价保存顺序无关。
-    records = [
-        (customer, count, subtotal)
-        for customer, (count, subtotal) in sorted(
-            groups.items(), key=lambda item: item[0].encode("utf-8")
-        )
-    ]
+    # 读库之后的全部统计规则都在纯函数中：精确筛选、逐字符分组、每张计一次、
+    # 整数累计与 BINARY 排序均不触碰数据库或文件。
+    records = summarize_quote_rows(rows, customer_filter)
 
     if output is None:
-        # 未指定 --output：保留既有单行 JSON 行为。
-        # 张数与累计金额均为 JSON 整数（分单位），不换算为元；
-        # ensure_ascii=False 保留客户原文，json.dumps 只做 JSON 所需转义。
-        payload = [
-            {"customer": customer, "quote_count": count, "total": subtotal}
-            for customer, count, subtotal in records
-        ]
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。
+        sys.stdout.write(render_report_json(records))
         return 0
 
     document = render_report_html(records)
