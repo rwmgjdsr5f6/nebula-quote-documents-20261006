@@ -1,0 +1,381 @@
+报价 JSON 导出与重新保存往返说明（export → save → preview）
+=============================================================
+
+本说明只讲一条已有流程：用 export 按编号把源库中的报价导出为一行 JSON，
+把这行 JSON 作为 UTF-8 文件交给 save 保存到另一份数据库，再用 preview
+从目标库取数生成预览；并说明这条链路上“内容一致”的边界在哪里。
+本文只交付说明，不改动 save、preview、list、export 任何命令的参数、
+输出与数据库兼容行为。
+
+核对基准与表述约定
+------------------
+- 产品源码：仓库根目录 quote.py（唯一可执行源码，当前全文 502 行）。
+  本说明中的行号均以当前 quote.py 为准，引用方式为 quote.py:<行号>。
+- 公开文档：README.md（save 见 7-33 行、preview 见 35-49 行、
+  export 见 51-72 行）。
+- 回归测试：tests/ 下 11 个文件共 65 个用例；本次核对时执行
+  python3 -m unittest discover -s tests，65 个全部通过（耗时约 28 秒）。
+- 标注约定（严格区分，不混用）：
+  【源码】= 只凭阅读当前 quote.py 即可确定的事实，标注函数名与行号；
+  【测试】= 已有回归测试覆盖的断言，标注测试文件与用例位置；
+  【实测】= 本次在仓库外临时目录（/tmp）用公开命令实际运行所得，
+           运行环境为 Linux / Python 3.14.4 / 标准库 sqlite3；
+           产品源码、README、其他文档与数据格式均未改动，仓库内未留下
+           任何 JSON/SQLite/HTML。凡未标【实测】的行为描述均不属于
+           本次执行记录；未执行的样例只写预期。
+
+
+一、链路与公开入口的对应关系
+----------------------------
+整条往返由三个相互独立的进程组成，中间只靠文件传递，没有内存态共享：
+
+  源库 source.sqlite                目标库 copy.sqlite
+  ─────────────────                ─────────────────
+  export（只读取源库）
+    → 标准输出一行 JSON
+      → 调用者原样保存为 UTF-8 文件
+        → save（校验后写入目标库）
+          → preview（只读取目标库，生成 HTML）
+
+公开命令（README.md:10、38、54；argparse 定义见 build_parser()
+quote.py:460-491，分发见 main() quote.py:494-497）：
+
+  python3 quote.py save    --db source.sqlite --input quote.json
+  python3 quote.py export  --db source.sqlite --number Q-COPY-001
+  python3 quote.py save    --db copy.sqlite   --input exported.json
+  python3 quote.py preview --db copy.sqlite   --number Q-COPY-001 --output copy.html
+
+各环节的处理函数与源码位置【源码】：
+
+  环节                     函数                位置
+  ----------------------------------------------------------------
+  导出：只读打开源库        cmd_export()        quote.py:386-390
+  导出：表/列存在性检查     cmd_export()        quote.py:392-415
+  导出：按编号取主行        cmd_export()        quote.py:417-430
+  导出：按位置取明细        cmd_export()        quote.py:433-437
+  导出：组装并输出 JSON     cmd_export()        quote.py:443-456
+  保存：读文件/解析/校验    cmd_save()、validate_quote()
+                                                quote.py:155-173、69-138
+  保存：建库补列与写入      ensure_schema()、cmd_save()
+                                                quote.py:147-152、176-208
+  预览：只读取数            cmd_preview()       quote.py:275-311
+  预览：渲染 HTML           render_html()、format_yuan()
+                                                quote.py:211-272
+
+list（cmd_list()，quote.py:346-383）不在这条链路上：它只输出编号、客户与
+分单位整数合计的摘要（quote.py:377-382），不读 note、不读明细，导出与
+重新保存均不经过它。list 的行为本次不变，本文不展开。
+
+
+二、导出端：源库如何被读取（cmd_export，quote.py:386-457）
+----------------------------------------------------------
+1. 以只读 URI 打开：file:<绝对路径>?mode=ro（quote.py:387-390）。数据库
+   文件不存在或不可访问时抛 sqlite3.Error，报“无法读取数据库 ……”，
+   退出码 1，且不创建数据库文件（详见第六节边界清单）。
+2. 表与列的存在性检查（quote.py:392-415）：quotes 表必须存在且含
+   number、customer 列；items 表必须存在且含 quote_number、position、
+   description、quantity、unit_price 列。缺表或缺列一律抛
+   sqlite3.Error，按“无法读取数据库”处理。唯一例外是 quotes.note：
+   旧库缺 note 列时按无说明导出，不补列、不改动已有数据
+   （quote.py:392-393 的注释与 417-426 的两条 SELECT）。
+3. 按编号取主行：WHERE number = ? 用命令行原文绑定（quote.py:417-426），
+   SQLite TEXT 默认 BINARY 比较，大小写与空格都参与匹配，不做任何
+   归一化（quote.py:431-432 的注释）。查不到即
+   “错误: 报价编号不存在: <编号>”，退出码 1，标准输出为空
+   （quote.py:427-429、fail() 见 quote.py:50-53）。
+4. 取明细：SELECT description, quantity, unit_price FROM items
+   WHERE quote_number = ? ORDER BY position（quote.py:433-437），
+   即严格按保存时的输入顺序。注意 SELECT 列表里没有 id、position、
+   line_amount——它们只用于排序或根本不出库。
+5. 全部读取成功后才输出整份 JSON（quote.py:454-456）：任何失败路径
+   都不会在标准输出留下部分 JSON。
+
+导出是只读的【测试】：tests/test_export_flow.py:229 断言导出前后
+quotes/items 全部行与 sqlite_master 表结构不变；
+tests/test_export_flow.py:183（216-227 行）断言导出前后源库文件
+逐字节一致，且不留下 WAL/SHM 侧车文件。
+
+
+三、JSON 输出形态（cmd_export 的组装段，quote.py:443-456）
+----------------------------------------------------------
+输出结构与 save 接受的输入一致（quote.py:443-444 的注释）：
+
+  {"number": ..., "customer": ..., "items": [...], "note": ...}
+
+- 字段白名单：顶层只有 number、customer、items，说明非空时再加 note
+  （quote["note"] 在 items 之后追加，quote.py:449-452）。内部标识
+  （items.id、position）、行金额 line_amount 与合计 total 一律不导出
+  ——SELECT 列表（quote.py:433-435）与字典组装（quote.py:445-449）
+  中都没有它们。
+- 每条明细只有 description、quantity、unit_price 三个键
+  （quote.py:445-448）。明细顺序就是库内 position 升序，即输入顺序；
+  说明相同的重复明细各自保留为独立行，不合并、不去重。
+  【测试】tests/test_export_flow.py:271（三条相同说明的明细按序导出，
+  含零单价与 int64 大整数）。
+- 数量与单价是 JSON 整数：它们以 INTEGER 列入库（SCHEMA，
+  quote.py:30-38），sqlite3 读回为 Python int，json.dumps 输出为
+  十进制整数字面量；不转为元、浮点数或字符串，含零单价与有符号
+  64 位范围内的大整数。【测试】tests/test_export_flow.py:169-173、
+  tests/test_export_preview_flow.py:616（int64 上限单价往返无精度
+  损失）。
+- 文本只做 JSON 所需转义：json.dumps(..., ensure_ascii=False)
+  （quote.py:456）保留非 ASCII 原文，中文、尖括号、与号逐字符输出；
+  只有 JSON 语法要求的字符被转义（如换行写成 \n 两字符、引号写成
+  \"）。绝不出现 &lt;、&amp; 等 HTML 实体——HTML 转义是预览端
+  render_html 的职责，导出端不调用它。
+  【测试】tests/test_export_flow.py:175-181（导出文本不含任何 HTML
+  实体与 <、& 的转义形式）。
+- note 的输出规则（quote.py:450-452）：非空说明（含纯空白）原样输出；
+  NULL 或空字符串说明省略 note 键。【测试】
+  tests/test_export_flow.py:359（NULL 与空字符串省略、纯空白原样）。
+- 输出形态：sys.stdout.write(json.dumps(...) + "\n")（quote.py:456），
+  即标准输出是一行完整 JSON、以单个 LF 换行结束；成功时退出码 0、
+  标准错误为空。【测试】tests/test_export_flow.py:135-139（恰好一个
+  末尾换行、无 CR、整体为合法 UTF-8）。
+
+
+四、目标库重新保存（cmd_save，quote.py:155-208）
+------------------------------------------------
+导出的 JSON 就是合法的 save 输入：字段白名单与 validate_quote 的
+必填/可选规则（quote.py:79-94、107-123）逐一对齐，因此导出文件可以
+原样作为 --input 交给另一份数据库，中间不需要任何手工编辑。
+
+保存侧的关键事实【源码】：
+
+- 编号来自输入 JSON 的 number 原文，成功时标准输出打印该编号
+  （print(number)，quote.py:207），退出码 0，标准错误为空。
+- 金额由明细重新计算，不复制源库的派生金额：导出的 JSON 里根本没有
+  line_amount 与 total（见第三节），save 侧 validate_quote 重新计算
+  行金额 line_amount = quantity * unit_price（quote.py:128）与
+  合计 total = 各行之和（quote.py:134），纯整数运算。目标库的
+  quotes.total 与 items.line_amount 是这次计算的结果，不是从源库
+  抄来的。
+- 文本原样落库：合法文本不做 trim、不做转义（quote.py:61-66 只返回
+  原值，写入为参数直传 quote.py:186-199），note 非空原文保存
+  （quote.py:86-94）。
+- 目标库已有同号报价时：主表 INSERT 触发 sqlite3.IntegrityError，
+  转为 DuplicateNumber（quote.py:190-191），走 fail()——标准错误
+  “错误: 报价编号已存在: <编号>”，退出码 1，标准输出为空；写入
+  事务回滚，本次主行与明细均不写入，目标库既有报价与明细不被覆盖
+  （quote.py:184-201）。【测试】tests/test_export_preview_flow.py:500
+  （目标库重复保存同一导出内容被拒、既有数据不变）、
+  tests/test_duplicate_flow.py:244。
+- 旧库兼容：目标库缺 note 列时 ensure_schema 就地补列
+  （quote.py:147-152），与源库是否旧库无关。
+
+
+五、预览取数（cmd_preview，quote.py:275-343）
+---------------------------------------------
+preview 从目标库只读取数（只读 URI，quote.py:280-284），与导出端
+互不依赖：它读的是 save 落库后的行，不是导出时的中间结果。
+
+- 客户、合计、说明取自 quotes 行；说明、数量、单价、行金额取自
+  items 行（quote.py:285-306）。旧库缺 note 列时按无说明处理，
+  只读打开不补列（quote.py:285-296）。
+- 金额分转元：format_yuan(cents) = f"{cents // 100}.{cents % 100:02d}"
+  （quote.py:211-213），纯整数运算，单价、行金额、总计三处都经此
+  函数（quote.py:223-224、267）。
+- 用户文本只在 HTML 中转义：render_html 内 e = html.escape
+  （quote.py:217）作用于编号、客户、说明与每条明细说明
+  （quote.py:221、237、244、256-257）。这是全链路唯一的转义点——
+  库里与导出 JSON 里始终是用户原文。
+- 说明区域：note 非空时在客户信息之后、明细表格之前出现
+  <section class="note">，正文放入 <p class="note-text">，样式
+  white-space: pre-wrap 保留空格与换行（quote.py:228-239、259）。
+
+
+六、固定合成样例 Q-COPY-001（本次实测）
+----------------------------------------
+下列输入、命令与结果均【实测】（/tmp 临时目录，新数据库）。样例覆盖：
+客户含尖括号与和号、说明含首尾空格与换行、两条明细说明相同（“服务”）。
+
+6.1 输入文件 quote.json（UTF-8）：
+
+{
+  "number": "Q-COPY-001",
+  "customer": "演示<甲>&乙",
+  "note": "  演示\n说明  ",
+  "items": [
+    {"description": "服务", "quantity": 2, "unit_price": 1250},
+    {"description": "服务", "quantity": 1, "unit_price": 300}
+  ]
+}
+
+字符层面提醒：JSON 文本里的 \n 是两个字符的转义序列，解析后成为一个
+换行符；note 首尾各两个空格在引号之内。
+
+6.2 保存到源库：
+
+  python3 quote.py save --db source.sqlite --input quote.json
+
+【实测】退出码 0；标准输出恰好一行 Q-COPY-001；标准错误为空。
+
+6.3 从源库导出（结果重定向为 UTF-8 文件）：
+
+  python3 quote.py export --db source.sqlite --number Q-COPY-001 > exported.json
+
+【实测】退出码 0；标准错误为空（0 字节）；标准输出是一行完整 JSON、
+以单个 LF（0x0A）结束、无 CR。该行原文为（其中 note 里的 \n 是
+反斜杠加 n 两个字符，即 JSON 对换行符的转义）：
+
+{"number": "Q-COPY-001", "customer": "演示<甲>&乙", "items": [{"description": "服务", "quantity": 2, "unit_price": 1250}, {"description": "服务", "quantity": 1, "unit_price": 300}], "note": "  演示\n说明  "}
+
+对照第三节可核对：客户中的 < > & 原样出现、无 HTML 实体；两条“服务”
+明细按输入顺序各自独立；数量 2、1 与单价 1250、300 是 JSON 整数；
+没有 id、position、line_amount、total；note 因非空而出现、原文保留
+首尾空格。
+
+6.4 把导出文件保存到目标库：
+
+  python3 quote.py save --db copy.sqlite --input exported.json
+
+【实测】退出码 0；标准输出恰好一行 Q-COPY-001（原编号）；标准错误
+为空。保存后直查 copy.sqlite：
+
+  quotes: ('Q-COPY-001', '演示<甲>&乙', 2800, '  演示\n说明  ')
+  items:  ('Q-COPY-001', 0, '服务', 2, 1250, 2500)
+          ('Q-COPY-001', 1, '服务', 1, 300, 300)
+
+即行金额 2500、300 分，合计 2800 分——由目标库 save 按
+2×1250、1×300 重新计算（quote.py:128、134），与源库派生金额
+数值一致但并非复制而来；客户与说明逐字符不变。
+
+6.5 从目标库生成预览：
+
+  python3 quote.py preview --db copy.sqlite --number Q-COPY-001 --output copy.html
+
+【实测】退出码 0；标准输出恰好一行 copy.html；标准错误为空。
+生成的 UTF-8 HTML 中可核对的关键片段。下面用 ---- 定界的整块即
+copy.html 中的连续原文，定界符之间不从属本文档缩进：说明区域第二行
+“说明  </p>”顶格、左侧没有空格——那是 note 内嵌换行后的真实样子：
+----
+  <dt>客户</dt><dd>演示&lt;甲&gt;&amp;乙</dd>
+----
+----
+<section class="note">
+  <h2>客户说明</h2>
+  <p class="note-text">  演示
+说明  </p>
+</section>
+----
+----
+      <tr><td>1</td><td>服务</td><td class="num">2</td><td class="num">12.50</td><td class="num">25.00</td></tr>
+      <tr><td>2</td><td>服务</td><td class="num">1</td><td class="num">3.00</td><td class="num">3.00</td></tr>
+    <tr><td colspan="4">总计（元）</td><td class="num">28.00</td></tr>
+----
+
+即：行金额显示 25.00、3.00 元，总计 28.00 元（2500/300/2800 分经
+format_yuan 换算，quote.py:211-213）；客户与说明只在 HTML 中被转义
+（&lt; &gt; &amp;），说明区域的两空格与换行由 pre-wrap 保留
+（quote.py:233）。说明区域位于客户信息 </dl> 之后、明细 <table>
+之前（quote.py:259）。
+
+【测试】同一条“导出→重新保存→两库各自预览”链路（不同样例常量）由
+tests/test_export_preview_flow.py:399 覆盖：断言源库与目标库生成的
+两份预览逐字节一致，且整篇逐字符等于测试内写死的固定预期文档；
+说明省略与纯空白两种形态的往返见 tests/test_export_preview_flow.py:528、
+566。
+
+
+七、边界行为清单（附源码依据）
+------------------------------
+统一失败出口 fail()：stderr 打印“错误: <原因>”并返回退出码 1
+（quote.py:50-53）。
+
+  情形                         退出码 / stdout / stderr                     依据与副作用
+  --------------------------------------------------------------------------------------------
+  导出未知编号                 1；stdout 为空；                              WHERE 原文精确匹配未命中
+                               stderr“错误: 报价编号不存在: <编号>”          （quote.py:427-429）；
+                                                                            大小写、首尾空格都参与匹配
+                                                                            【实测】Q-UNKNOWN 结果如上
+                                                                            【测试】tests/test_export_flow.py:301
+  数据库不存在                 1；stdout 为空；                              只读 URI 打开失败
+                               stderr“错误: 无法读取数据库 <路径>: ……”       （quote.py:387-390、440-441）；
+                                                                            不创建数据库文件
+                                                                            【实测】missing.sqlite 未生成
+                                                                            【测试】tests/test_export_flow.py:478
+  数据库不可访问/不可读        1；stdout 为空；stderr 同上前缀                同上【测试】tests/test_export_flow.py:575
+  文件不是有效 SQLite          1；stdout 为空；stderr 同上前缀                查询时抛 sqlite3.Error；
+                                                                            原文件内容不变
+                                                                            【实测】“file is not a database”
+                                                                            【测试】tests/test_export_flow.py:489
+  缺少导出所需表/列            1；stdout 为空；stderr 同上前缀                显式检查 quotes/items 表与必要列
+                                                                            （quote.py:392-415）；唯一例外是
+                                                                            quotes.note（见下）
+                                                                            【测试】tests/test_export_flow.py:500、
+                                                                            520、538、555
+  旧库缺少 note 列             0；正常导出，JSON 不含 note                    按无说明导出，不补列、不改动
+                                                                            已有数据（quote.py:417-426）
+                                                                            【实测】三列旧库导出成功、导出后
+                                                                            仍只有 number/customer/total 三列
+                                                                            【测试】tests/test_export_flow.py:407
+  说明为 NULL 或空字符串       0；导出不带 note 键                            quote.py:450-452
+                                                                            【测试】tests/test_export_flow.py:359
+  说明为纯空白                 0；note 原样输出                               纯空白不是空字符串，不在归并之列
+                                                                            （quote.py:450-452）
+                                                                            【测试】tests/test_export_flow.py:359
+  目标库已有同号报价           1；stdout 为空；                              主键冲突→DuplicateNumber，写入
+                               stderr“错误: 报价编号已存在: <编号>”          事务回滚，原报价与明细不被覆盖
+                                                                            （quote.py:184-201）
+                                                                            【实测】重复保存后 copy.sqlite 的
+                                                                            quotes/items 行数与内容不变
+                                                                            【测试】tests/test_export_preview_flow.py:500
+
+  以上所有失败路径的共同点：标准输出为空或不含任何部分 JSON——导出在
+  全部读取成功后才一次性输出（quote.py:454-456），保存在校验全部通过
+  后才触碰数据库（quote.py:170-179）。
+
+
+八、一致性结论的边界
+--------------------
+可以依赖的结论（【源码】+ 第六、七节【实测】+ 所引【测试】）：
+
+  对“由 save 合法保存、且保存后未被改写的源报价”，export → save →
+  preview 往返后：编号、客户、说明（含首尾空格与换行）逐字符一致；
+  明细条数、顺序、说明、数量、单价一致；目标库行金额与合计在数值上
+  等于源库；两份预览内容一致。
+
+结论的边界（不要外推）：
+
+1. 目标库的金额是重新计算的，不是复制的。导出 JSON 不含 line_amount
+   与 total（quote.py:445-449），目标库的派生金额由 validate_quote
+   按明细重新相乘、求和（quote.py:128、134）。因此“金额一致”只对
+   派生金额本身正确的源报价成立——即由 save 写入、落库后未被直接
+   改动的报价。若源库的行金额/合计被 SQL 手工改成与明细不符，导出
+   不会发现（它根本不读这两列），目标库会按明细算出“正确”金额，
+   两库的 total 反而不同。
+2. 一致性只覆盖导出字段白名单内的内容。items.id、position、
+   line_amount、quotes.total 不参与导出；position 在目标库按数组
+   顺序重新编号（quote.py:192-199），id 由目标库 AUTOINCREMENT 分配，
+   二者在源库与目标库之间没有对应关系。
+3. 编号按原文精确匹配，往返不改变编号；目标库已存在同号报价时整个
+   保存被拒绝，不存在“合并”或“覆盖”路径（quote.py:184-201）。
+4. 文本层面：导出 JSON 与数据库中始终是用户原文，转义只发生在两处
+   边界——JSON 语法所需转义（导出时 json.dumps，quote.py:456）与
+   HTML 转义（预览时 html.escape，quote.py:217）。两处都不改变库中
+   数据，也不互相嵌套。
+
+
+九、顺着源码与测试复核的入口
+----------------------------
+  1. 导出读取与检查：cmd_export() quote.py:386-441（只读打开 387-390、
+     表列检查 392-415、note 兼容 417-426、明细排序 433-437）。
+  2. 输出组装：quote.py:443-456（白名单、note 规则、单行输出）。
+  3. 重新保存：cmd_save() quote.py:155-208；金额重算 validate_quote()
+     quote.py:128、134；重复编号 quote.py:184-201。
+  4. 预览取数与渲染：cmd_preview() quote.py:275-311；render_html()
+     quote.py:216-272；format_yuan() quote.py:211-213。
+  5. 回归测试（python3 -m unittest discover -s tests，本次 65 个
+     用例全部通过）：
+     - tests/test_export_flow.py:128   导出行形态、字段白名单、无 HTML 转义
+     - tests/test_export_flow.py:183   导出→保存往返、源库逐字节不变
+     - tests/test_export_flow.py:229   导出对数据与表结构只读
+     - tests/test_export_flow.py:271   重复说明明细按序保留
+     - tests/test_export_flow.py:301   编号原文精确匹配
+     - tests/test_export_flow.py:359   note 的省略/输出规则
+     - tests/test_export_flow.py:407   旧库缺 note 列只读导出
+     - tests/test_export_flow.py:458   数据库不可读的各失败路径
+     - tests/test_export_preview_flow.py:399  往返后两份预览逐字节一致
+     - tests/test_export_preview_flow.py:500  目标库重复保存被拒
+     - tests/test_export_preview_flow.py:528、566  说明省略/纯空白往返
+     - tests/test_export_preview_flow.py:616  int64 大整数往返无精度损失
