@@ -344,6 +344,12 @@ def cmd_preview(args):
 
 
 def cmd_list(args):
+    # 客户筛选值在访问数据库前校验：空字符串或纯空白直接拒绝；
+    # 含有效文字时保留两端空白，原样参与精确匹配。
+    customer = args.customer
+    if customer is not None and not customer.strip():
+        return fail("客户筛选值不能为空白")
+
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
     db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
     try:
@@ -351,9 +357,18 @@ def cmd_list(args):
         try:
             # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
             # number 使用默认 BINARY 排序，与保存先后无关；旧库缺 note 列不影响本查询。
-            rows = conn.execute(
-                "SELECT number, customer, total FROM quotes ORDER BY number"
-            ).fetchall()
+            # 客户筛选用 = 精确比较（BINARY 排序规则）：大小写、空格、换行都参与
+            # 匹配，% 与 _ 等符号按普通字符处理，不做子串搜索或归一化。
+            if customer is None:
+                rows = conn.execute(
+                    "SELECT number, customer, total FROM quotes ORDER BY number"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT number, customer, total FROM quotes "
+                    "WHERE customer = ? ORDER BY number",
+                    (customer,),
+                ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -459,6 +474,11 @@ def build_parser():
 
     list_parser = subparsers.add_parser("list", help="列出已保存报价的编号、客户与合计")
     list_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    list_parser.add_argument(
+        "--customer",
+        default=None,
+        help="按客户名精确筛选（逐字符一致；省略时列出全部）",
+    )
     list_parser.set_defaults(handler=cmd_list)
 
     export_parser = subparsers.add_parser(
