@@ -6,7 +6,7 @@
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
   python quote.py list    --db demo.sqlite
   python quote.py export  --db demo.sqlite --number Q-DEMO-001
-  python quote.py report  --db demo.sqlite
+  python quote.py report  --db demo.sqlite [--customer 客户名]
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
 """
@@ -469,6 +469,12 @@ def cmd_export(args):
 
 
 def cmd_report(args):
+    # 客户筛选值在访问数据库前校验：空字符串或纯空白直接拒绝；
+    # 含有效文字时保留两端空白，原样参与精确匹配。
+    customer_filter = args.customer
+    if customer_filter is not None and not customer_filter.strip():
+        return fail("客户筛选值不能为空白")
+
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
     try:
         conn = open_readonly_database(args.db)
@@ -499,6 +505,10 @@ def cmd_report(args):
     # 连续空格与换行都参与比较，% 与 _ 按普通字符处理，不做任何归一化。
     groups = {}
     for customer, total in rows:
+        # 提供筛选值时只统计客户原文逐字符相同的报价（Python 字符串精确相等）：
+        # 大小写、首尾空格、连续空格与换行都参与比较，% 与 _ 按普通字符处理。
+        if customer_filter is not None and customer != customer_filter:
+            continue
         count, subtotal = groups.get(customer, (0, 0))
         groups[customer] = (count + 1, subtotal + total)
 
@@ -550,6 +560,11 @@ def build_parser():
         "report", help="按客户汇总报价张数与累计金额（只输出到标准输出）"
     )
     report_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    report_parser.add_argument(
+        "--customer",
+        default=None,
+        help="按客户名精确筛选（逐字符一致；省略时汇总全部客户）",
+    )
     report_parser.set_defaults(handler=cmd_report)
 
     return parser
