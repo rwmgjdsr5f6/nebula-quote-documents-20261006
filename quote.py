@@ -635,6 +635,66 @@ def render_report_html(records):
 """
 
 
+def fetch_quote_totals(conn):
+    """从已打开的连接读取全部报价的 (customer, total) 行：报表的数据库访问边界。
+
+    缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error，由调用方
+    统一收口。报表只需要 number、customer、total 三列；旧库缺 note 列不影响，
+    不补列、不改动已有数据；items 表不参与汇总，无需存在。
+    累计以已保存的报价合计为准，直接读取 total，不重新计算明细；
+    每张报价只取一行，含多条明细也不会重复计数。
+    """
+    quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+    required_columns = {"number", "customer", "total"}
+    if not quote_columns:
+        raise sqlite3.Error("缺少 quotes 表")
+    if not required_columns <= quote_columns:
+        raise sqlite3.Error(
+            "quotes 表缺少必要列: "
+            + ", ".join(sorted(required_columns - quote_columns))
+        )
+    return conn.execute("SELECT customer, total FROM quotes").fetchall()
+
+
+def summarize_quotes(rows, customer_filter=None):
+    """把 (customer, total) 行汇总为 (customer, count, subtotal) 有序记录。
+
+    纯函数：不触碰数据库、文件与标准流，可独立验证筛选、分组、累计与排序。
+    在 Python 中分组累计：SQLite 的 SUM 受有符号 64 位整数限制，多张合法
+    报价的累计可能超出该范围，Python 整数可以精确表示任意大的合计。
+    客户名逐字符相同才归入同一组（dict 键即精确相等）：大小写、首尾空格、
+    连续空格与换行都参与比较，% 与 _ 按普通字符处理，不做任何归一化。
+    提供筛选值时只统计客户原文逐字符相同的报价（Python 字符串精确相等）。
+    每张报价只计一次，零金额同样计数；结果按客户原文的 UTF-8 字节升序
+    排列，等价于 SQLite BINARY 排序，与报价保存顺序无关。
+    """
+    groups = {}
+    for customer, total in rows:
+        if customer_filter is not None and customer != customer_filter:
+            continue
+        count, subtotal = groups.get(customer, (0, 0))
+        groups[customer] = (count + 1, subtotal + total)
+    return [
+        (customer, count, subtotal)
+        for customer, (count, subtotal) in sorted(
+            groups.items(), key=lambda item: item[0].encode("utf-8")
+        )
+    ]
+
+
+def render_report_json(records):
+    """把汇总记录渲染为单行 JSON 文本（末尾恰好一个换行）：报表的 JSON 输出边界。
+
+    张数与累计金额均为 JSON 整数（分单位），不换算为元；
+    ensure_ascii=False 保留客户原文，json.dumps 只做 JSON 所需转义。
+    """
+    payload = [
+        {"customer": customer, "quote_count": count, "total": subtotal}
+        for customer, count, subtotal in records
+    ]
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
 def cmd_report(args):
     # 客户筛选值在访问数据库与创建输出文件前校验：空字符串或纯空白直接拒绝；
     # 含有效文字时保留两端空白，原样参与精确匹配。
@@ -651,57 +711,17 @@ def cmd_report(args):
     try:
         conn = open_readonly_database(args.db)
         try:
-            # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
-            # 报表只需要 number、customer、total 三列；旧库缺 note 列不影响，
-            # 不补列、不改动已有数据；items 表不参与汇总，无需存在。
-            quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
-            required_columns = {"number", "customer", "total"}
-            if not quote_columns:
-                raise sqlite3.Error("缺少 quotes 表")
-            if not required_columns <= quote_columns:
-                raise sqlite3.Error(
-                    "quotes 表缺少必要列: "
-                    + ", ".join(sorted(required_columns - quote_columns))
-                )
-            # 累计以已保存的报价合计为准，直接读取 total，不重新计算明细；
-            # 每张报价只取一行，含多条明细也不会重复计数。
-            rows = conn.execute("SELECT customer, total FROM quotes").fetchall()
+            rows = fetch_quote_totals(conn)
         finally:
             conn.close()
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
-    # 在 Python 中分组累计：SQLite 的 SUM 受有符号 64 位整数限制，多张合法
-    # 报价的累计可能超出该范围，Python 整数可以精确表示任意大的合计。
-    # 客户名逐字符相同才归入同一组（dict 键即精确相等）：大小写、首尾空格、
-    # 连续空格与换行都参与比较，% 与 _ 按普通字符处理，不做任何归一化。
-    groups = {}
-    for customer, total in rows:
-        # 提供筛选值时只统计客户原文逐字符相同的报价（Python 字符串精确相等）：
-        # 大小写、首尾空格、连续空格与换行都参与比较，% 与 _ 按普通字符处理。
-        if customer_filter is not None and customer != customer_filter:
-            continue
-        count, subtotal = groups.get(customer, (0, 0))
-        groups[customer] = (count + 1, subtotal + total)
-
-    # 按客户原文的 UTF-8 字节升序排列，等价于 SQLite BINARY 排序，
-    # 与报价保存顺序无关。
-    records = [
-        (customer, count, subtotal)
-        for customer, (count, subtotal) in sorted(
-            groups.items(), key=lambda item: item[0].encode("utf-8")
-        )
-    ]
+    records = summarize_quotes(rows, customer_filter)
 
     if output is None:
-        # 未指定 --output：保留既有单行 JSON 行为。
-        # 张数与累计金额均为 JSON 整数（分单位），不换算为元；
-        # ensure_ascii=False 保留客户原文，json.dumps 只做 JSON 所需转义。
-        payload = [
-            {"customer": customer, "quote_count": count, "total": subtotal}
-            for customer, count, subtotal in records
-        ]
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。
+        sys.stdout.write(render_report_json(records))
         return 0
 
     document = render_report_html(records)
