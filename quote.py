@@ -6,7 +6,7 @@
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
   python quote.py list    --db demo.sqlite
   python quote.py export  --db demo.sqlite --number Q-DEMO-001
-  python quote.py report  --db demo.sqlite [--customer 客户名]
+  python quote.py report  --db demo.sqlite [--customer 客户名] [--output report.html]
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
 """
@@ -312,6 +312,38 @@ def render_html(number, customer, note, items, total):
 """
 
 
+def write_new_file(path, data):
+    """以 O_EXCL 新建文件并循环写完整份字节，绝不覆盖已有文件。
+
+    成功返回 None；失败返回面向用户的原因字符串。os.write 一次可能只接受
+    部分字节，因此循环写剩余内容；返回 0 字节表示写入未取得进展，按失败
+    结束而不是空转。失败时目标里可能保留此前已写出的部分内容。
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        return str(exc)
+
+    error = None
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written == 0:
+                error = "写入未取得进展（write 返回 0 字节）"
+                break
+            view = view[written:]
+    except OSError as exc:
+        error = str(exc)
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            if error is None:
+                error = str(exc)
+    return error
+
+
 def cmd_preview(args):
     # 输出目标已存在时直接拒绝，绝不覆盖。
     if os.path.exists(args.output):
@@ -337,31 +369,7 @@ def cmd_preview(args):
     document = render_html(args.number, customer, note, item_rows, total)
 
     # O_EXCL 兜底：即使并发出现同名文件也不覆盖。
-    try:
-        fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except OSError as exc:
-        return fail(f"无法写入输出文件 {args.output}: {exc}")
-
-    # os.write 一次可能只接受部分字节：循环写剩余内容，直到整份文档写出。
-    # 返回 0 字节表示写入未取得进展，按失败结束而不是空转；写入或关闭
-    # 抛出 OSError 时同样以失败结束，目标里可能保留此前已写出的部分内容。
-    error = None
-    try:
-        view = memoryview(document.encode("utf-8"))
-        while view:
-            written = os.write(fd, view)
-            if written == 0:
-                error = "写入未取得进展（write 返回 0 字节）"
-                break
-            view = view[written:]
-    except OSError as exc:
-        error = str(exc)
-    finally:
-        try:
-            os.close(fd)
-        except OSError as exc:
-            if error is None:
-                error = str(exc)
+    error = write_new_file(args.output, document.encode("utf-8"))
     if error is not None:
         return fail(f"无法写入输出文件 {args.output}: {error}")
 
@@ -468,12 +476,65 @@ def cmd_export(args):
     return 0
 
 
+def render_report_html(records):
+    """渲染客户汇总离线 HTML：records 为 (customer, count, subtotal_cents)。
+
+    客户文本经 HTML 转义后放入 pre-wrap 单元格，首尾、连续空格与换行均
+    可见，不生成标签或脚本。金额为分单位 Python 整数（可超出 64 位），
+    直接整值换算为元并固定两位小数，不使用浮点。无客户行时显示空态提示。
+    """
+    e = html.escape
+    if records:
+        body_rows = "\n".join(
+            "      <tr>"
+            f"<td>{e(customer)}</td>"
+            f'<td class="num">{count}</td>'
+            f'<td class="num">{format_yuan(subtotal)}</td>'
+            "</tr>"
+            for customer, count, subtotal in records
+        )
+        rows_block = f"  <tbody>\n{body_rows}\n  </tbody>\n"
+        empty_notice = ""
+    else:
+        rows_block = "  <tbody>\n  </tbody>\n"
+        empty_notice = '  <p class="empty">没有匹配的报价</p>\n'
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>客户报价汇总</title>
+<style>
+  body {{ font-family: sans-serif; margin: 2em; }}
+  table {{ border-collapse: collapse; margin-top: 1em; }}
+  th, td {{ border: 1px solid #999; padding: 0.4em 0.8em; }}
+  .num {{ text-align: right; white-space: nowrap; }}
+  tbody td:first-child {{ white-space: pre-wrap; }}
+  .empty {{ margin-top: 1em; }}
+</style>
+</head>
+<body>
+<h1>客户报价汇总</h1>
+<table>
+  <thead>
+    <tr><th>客户</th><th>报价张数</th><th>累计金额（元）</th></tr>
+  </thead>
+{rows_block}</table>
+{empty_notice}</body>
+</html>
+"""
+
+
 def cmd_report(args):
-    # 客户筛选值在访问数据库前校验：空字符串或纯空白直接拒绝；
+    # 客户筛选值在访问数据库与创建输出文件前校验：空字符串或纯空白直接拒绝；
     # 含有效文字时保留两端空白，原样参与精确匹配。
     customer_filter = args.customer
     if customer_filter is not None and not customer_filter.strip():
         return fail("客户筛选值不能为空白")
+
+    # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
+    output = args.output
+    if output is not None and os.path.exists(output):
+        return fail(f"输出文件已存在: {output}")
 
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
     try:
@@ -513,15 +574,34 @@ def cmd_report(args):
         groups[customer] = (count + 1, subtotal + total)
 
     # 按客户原文的 UTF-8 字节升序排列，等价于 SQLite BINARY 排序，
-    # 与报价保存顺序无关。张数与累计金额均为 JSON 整数，不换算为元。
+    # 与报价保存顺序无关。
     records = [
-        {"customer": customer, "quote_count": count, "total": subtotal}
+        (customer, count, subtotal)
         for customer, (count, subtotal) in sorted(
             groups.items(), key=lambda item: item[0].encode("utf-8")
         )
     ]
-    # ensure_ascii=False 保留客户原文；json.dumps 只做 JSON 所需转义。
-    sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+
+    if output is None:
+        # 未指定 --output：保留既有单行 JSON 行为。
+        # 张数与累计金额均为 JSON 整数（分单位），不换算为元；
+        # ensure_ascii=False 保留客户原文，json.dumps 只做 JSON 所需转义。
+        payload = [
+            {"customer": customer, "quote_count": count, "total": subtotal}
+            for customer, count, subtotal in records
+        ]
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return 0
+
+    document = render_report_html(records)
+
+    # O_EXCL 兜底：即使并发出现同名文件也不覆盖；输出目录不存在等写入
+    # 失败在此报错，此前数据库只读访问不会留下任何改动。
+    error = write_new_file(output, document.encode("utf-8"))
+    if error is not None:
+        return fail(f"无法写入输出文件 {output}: {error}")
+
+    print(output)
     return 0
 
 
@@ -564,6 +644,11 @@ def build_parser():
         "--customer",
         default=None,
         help="按客户名精确筛选（逐字符一致；省略时汇总全部客户）",
+    )
+    report_parser.add_argument(
+        "--output",
+        default=None,
+        help="生成离线 HTML 汇总到该路径（目录需已存在）；省略时输出单行 JSON",
     )
     report_parser.set_defaults(handler=cmd_report)
 
