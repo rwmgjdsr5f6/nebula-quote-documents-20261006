@@ -208,6 +208,45 @@ def cmd_save(args):
     return 0
 
 
+def open_readonly_database(path):
+    """以只读方式打开数据库：不存在或不可访问时不创建任何文件。"""
+    db_uri = f"file:{pathname2url(os.path.abspath(path))}?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def find_quote(conn, number, extra_columns=()):
+    """按编号精确匹配报价主行，返回 (customer, note, extras)；不存在返回 None。
+
+    编号按原文精确匹配（SQLite TEXT 默认 BINARY 比较）：大小写与空格都
+    参与匹配，不做任何归一化。旧库缺 note 列（只读打开不能补列）时一律
+    视为无说明（note 为 NULL），不补列、不改动已有数据。extra_columns
+    为调用方各自需要的附加列（如 preview 的 total），查询结果按给定
+    顺序放在 extras 列表中返回。
+    """
+    quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+    note_select = "note" if "note" in quote_columns else "NULL"
+    extra_select = "".join(f", {column}" for column in extra_columns)
+    row = conn.execute(
+        f"SELECT customer, {note_select}{extra_select} FROM quotes WHERE number = ?",
+        (number,),
+    ).fetchone()
+    if row is None:
+        return None
+    customer, note, *extras = row
+    return customer, note, extras
+
+
+def fetch_items(conn, number, columns):
+    """按 position 顺序读取明细的指定列：保持顺序，不合并重复说明。"""
+    return conn.execute(
+        f"SELECT {', '.join(columns)} FROM items WHERE quote_number = ? "
+        "ORDER BY position",
+        (number,),
+    ).fetchall()
+
+
 def format_yuan(cents):
     """非负整数分 -> 元字符串，保留两位小数。"""
     return f"{cents // 100}.{cents % 100:02d}"
@@ -277,34 +316,20 @@ def cmd_preview(args):
     if os.path.exists(args.output):
         return fail(f"输出文件已存在: {args.output}")
 
-    # 以只读方式打开，数据库不可访问或不存在时不创建任何文件。
-    db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
+    # 预览需要已存的合计与行金额：直接读取，不重新计算。
     try:
-        conn = sqlite3.connect(db_uri, uri=True)
-        conn.execute("PRAGMA foreign_keys = ON")
-        # 旧库可能没有 note 列（只读打开不能补列），此时一律视为无说明。
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
-        if "note" in columns:
-            cursor = conn.execute(
-                "SELECT customer, total, note FROM quotes WHERE number = ?",
-                (args.number,),
+        conn = open_readonly_database(args.db)
+        try:
+            found = find_quote(conn, args.number, ("total",))
+            if found is None:
+                return fail(f"报价编号不存在: {args.number}")
+            customer, note, (total,) = found
+            item_rows = fetch_items(
+                conn, args.number,
+                ("description", "quantity", "unit_price", "line_amount"),
             )
-        else:
-            cursor = conn.execute(
-                "SELECT customer, total, NULL FROM quotes WHERE number = ?",
-                (args.number,),
-            )
-        quote_row = cursor.fetchone()
-        if quote_row is None:
+        finally:
             conn.close()
-            return fail(f"报价编号不存在: {args.number}")
-        customer, total, note = quote_row
-        item_rows = conn.execute(
-            "SELECT description, quantity, unit_price, line_amount "
-            "FROM items WHERE quote_number = ? ORDER BY position",
-            (args.number,),
-        ).fetchall()
-        conn.close()
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
@@ -384,13 +409,12 @@ def cmd_list(args):
 
 
 def cmd_export(args):
-    # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
-    db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
     try:
-        conn = sqlite3.connect(db_uri, uri=True)
+        conn = open_readonly_database(args.db)
         try:
             # 缺表或缺列都按无法读取数据库处理；旧库缺 note 列是唯一例外，
-            # 此时按无说明导出，不补列、不改动已有数据。
+            # 由 find_quote 按无说明处理，不补列、不改动已有数据。
+            # 导出只需要下列各列：total 与 line_amount 缺失不影响导出。
             quote_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(quotes)")
             }
@@ -414,27 +438,13 @@ def cmd_export(args):
                     + ", ".join(sorted(required_item_columns - item_columns))
                 )
 
-            if "note" in quote_columns:
-                cursor = conn.execute(
-                    "SELECT customer, note FROM quotes WHERE number = ?",
-                    (args.number,),
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT customer, NULL FROM quotes WHERE number = ?",
-                    (args.number,),
-                )
-            quote_row = cursor.fetchone()
-            if quote_row is None:
+            found = find_quote(conn, args.number)
+            if found is None:
                 return fail(f"报价编号不存在: {args.number}")
-            customer, note = quote_row
-            # 编号按原文精确匹配（SQLite TEXT 默认 BINARY 比较）：
-            # 大小写与空格都参与匹配，不做任何归一化。
-            item_rows = conn.execute(
-                "SELECT description, quantity, unit_price "
-                "FROM items WHERE quote_number = ? ORDER BY position",
-                (args.number,),
-            ).fetchall()
+            customer, note, _ = found
+            item_rows = fetch_items(
+                conn, args.number, ("description", "quantity", "unit_price")
+            )
         finally:
             conn.close()
     except sqlite3.Error as exc:
