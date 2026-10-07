@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""报价单保存、按编号生成 HTML 预览与按编号导出 JSON。
+"""报价单保存、按编号生成 HTML 预览、摘要列表、按编号导出 JSON 与按客户汇总报表。
 
 仅使用 Python 3 标准库与本地 SQLite：
   python quote.py save    --db demo.sqlite --input quote.json
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
   python quote.py list    --db demo.sqlite
   python quote.py export  --db demo.sqlite --number Q-DEMO-001
+  python quote.py report  --db demo.sqlite
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
 """
@@ -467,6 +468,53 @@ def cmd_export(args):
     return 0
 
 
+def cmd_report(args):
+    # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
+    try:
+        conn = open_readonly_database(args.db)
+        try:
+            # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
+            # 报表只需要 number、customer、total 三列；旧库缺 note 列不影响，
+            # 不补列、不改动已有数据；items 表不参与汇总，无需存在。
+            quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+            required_columns = {"number", "customer", "total"}
+            if not quote_columns:
+                raise sqlite3.Error("缺少 quotes 表")
+            if not required_columns <= quote_columns:
+                raise sqlite3.Error(
+                    "quotes 表缺少必要列: "
+                    + ", ".join(sorted(required_columns - quote_columns))
+                )
+            # 累计以已保存的报价合计为准，直接读取 total，不重新计算明细；
+            # 每张报价只取一行，含多条明细也不会重复计数。
+            rows = conn.execute("SELECT customer, total FROM quotes").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return fail(f"无法读取数据库 {args.db}: {exc}")
+
+    # 在 Python 中分组累计：SQLite 的 SUM 受有符号 64 位整数限制，多张合法
+    # 报价的累计可能超出该范围，Python 整数可以精确表示任意大的合计。
+    # 客户名逐字符相同才归入同一组（dict 键即精确相等）：大小写、首尾空格、
+    # 连续空格与换行都参与比较，% 与 _ 按普通字符处理，不做任何归一化。
+    groups = {}
+    for customer, total in rows:
+        count, subtotal = groups.get(customer, (0, 0))
+        groups[customer] = (count + 1, subtotal + total)
+
+    # 按客户原文的 UTF-8 字节升序排列，等价于 SQLite BINARY 排序，
+    # 与报价保存顺序无关。张数与累计金额均为 JSON 整数，不换算为元。
+    records = [
+        {"customer": customer, "quote_count": count, "total": subtotal}
+        for customer, (count, subtotal) in sorted(
+            groups.items(), key=lambda item: item[0].encode("utf-8")
+        )
+    ]
+    # ensure_ascii=False 保留客户原文；json.dumps 只做 JSON 所需转义。
+    sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="报价单保存与 HTML 预览")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -497,6 +545,12 @@ def build_parser():
     export_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
     export_parser.add_argument("--number", required=True, help="报价编号（原文精确匹配）")
     export_parser.set_defaults(handler=cmd_export)
+
+    report_parser = subparsers.add_parser(
+        "report", help="按客户汇总报价张数与累计金额（只输出到标准输出）"
+    )
+    report_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    report_parser.set_defaults(handler=cmd_report)
 
     return parser
 
