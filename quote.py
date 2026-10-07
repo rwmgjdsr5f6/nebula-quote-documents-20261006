@@ -4,7 +4,7 @@
 仅使用 Python 3 标准库与本地 SQLite：
   python quote.py save    --db demo.sqlite --input quote.json
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
-  python quote.py list    --db demo.sqlite
+  python quote.py list    --db demo.sqlite [--customer 客户名] [--output list.html]
   python quote.py export  --db demo.sqlite --number Q-DEMO-001
   python quote.py report  --db demo.sqlite [--customer 客户名] [--output report.html]
 
@@ -382,12 +382,68 @@ def cmd_preview(args):
     return 0
 
 
+def render_list_html(rows):
+    """渲染报价列表离线 HTML：rows 为 (number, customer, total_cents)。
+
+    编号与客户文本经 HTML 转义后放入 pre-wrap 单元格：首尾、连续空格与
+    换行均可见，多行文本仍属于同一报价行，不拆出新行，也不生成标签或
+    脚本。合计直接读取库中保存值，以分单位 Python 整数精确换算为元并
+    固定两位小数，不重新计算明细、不使用浮点；零金额显示 0.00，超出
+    有符号 64 位上限的整数也不丢精度。无报价行时保留表头并显示空态提示。
+    """
+    e = html.escape
+    if rows:
+        body_rows = "\n".join(
+            "      <tr>"
+            f"<td>{e(number)}</td>"
+            f"<td>{e(customer)}</td>"
+            f'<td class="num">{format_yuan(total)}</td>'
+            "</tr>"
+            for number, customer, total in rows
+        )
+        rows_block = f"  <tbody>\n{body_rows}\n  </tbody>\n"
+        empty_notice = ""
+    else:
+        rows_block = "  <tbody>\n  </tbody>\n"
+        empty_notice = '  <p class="empty">没有匹配的报价</p>\n'
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>报价列表</title>
+<style>
+  body {{ font-family: sans-serif; margin: 2em; }}
+  table {{ border-collapse: collapse; margin-top: 1em; }}
+  th, td {{ border: 1px solid #999; padding: 0.4em 0.8em; }}
+  .num {{ text-align: right; white-space: nowrap; }}
+  tbody td:nth-child(1), tbody td:nth-child(2) {{ white-space: pre-wrap; }}
+  .empty {{ margin-top: 1em; }}
+</style>
+</head>
+<body>
+<h1>报价列表</h1>
+<table>
+  <thead>
+    <tr><th>报价编号</th><th>客户</th><th>合计（元）</th></tr>
+  </thead>
+{rows_block}</table>
+{empty_notice}</body>
+</html>
+"""
+
+
 def cmd_list(args):
-    # 客户筛选值在访问数据库前校验：空字符串或纯空白直接拒绝；
+    # 客户筛选值在访问数据库与创建输出文件前校验：空字符串或纯空白直接拒绝；
     # 含有效文字时保留两端空白，原样参与精确匹配。
     customer = args.customer
     if customer is not None and not customer.strip():
         return fail("客户筛选值不能为空白")
+
+    # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
+    output = args.output
+    if output is not None and os.path.exists(output):
+        return fail(f"输出文件已存在: {output}")
 
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
     db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
@@ -395,7 +451,8 @@ def cmd_list(args):
         conn = sqlite3.connect(db_uri, uri=True)
         try:
             # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
-            # number 使用默认 BINARY 排序，与保存先后无关；旧库缺 note 列不影响本查询。
+            # number 使用默认 BINARY 排序，与保存先后无关；旧库缺 note 列或
+            # 缺 items 表都不影响本查询，不补结构、不改动已有记录。
             # 客户筛选用 = 精确比较（BINARY 排序规则）：大小写、空格、换行都参与
             # 匹配，% 与 _ 等符号按普通字符处理，不做子串搜索或归一化。
             if customer is None:
@@ -413,12 +470,25 @@ def cmd_list(args):
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
-    # 原文输出编号与客户，不做转义或裁剪；total 为分单位整数，不换算。
-    records = [
-        {"number": number, "customer": customer, "total": total}
-        for number, customer, total in rows
-    ]
-    sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+    if output is None:
+        # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。
+        # 原文输出编号与客户，不做转义或裁剪；total 为分单位整数，不换算。
+        records = [
+            {"number": number, "customer": customer, "total": total}
+            for number, customer, total in rows
+        ]
+        sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+        return 0
+
+    document = render_list_html(rows)
+
+    # O_EXCL 兜底：即使并发出现同名文件也不覆盖；输出目录不存在等写入
+    # 失败在此报错，此前数据库只读访问不会留下任何改动。
+    error = write_new_file(output, document.encode("utf-8"))
+    if error is not None:
+        return fail(f"无法写入输出文件 {output}: {error}")
+
+    print(output)
     return 0
 
 
@@ -648,6 +718,11 @@ def build_parser():
         "--customer",
         default=None,
         help="按客户名精确筛选（逐字符一致；省略时列出全部）",
+    )
+    list_parser.add_argument(
+        "--output",
+        default=None,
+        help="生成离线 HTML 列表到该路径（目录需已存在）；省略时输出单行 JSON",
     )
     list_parser.set_defaults(handler=cmd_list)
 
