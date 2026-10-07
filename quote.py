@@ -487,6 +487,10 @@ def render_report_html(records):
     客户文本经 HTML 转义后放入 pre-wrap 单元格，首尾、连续空格与换行均
     可见，不生成标签或脚本。金额为分单位 Python 整数（可超出 64 位），
     直接整值换算为元并固定两位小数，不使用浮点。无客户行时显示空态提示。
+    所有客户行之后另起 tfoot 合计行：合计仅覆盖本次筛选命中的报价，
+    每张报价计数一次（含零金额），金额为各客户累计之和；空库或无匹配时
+    合计行为 0 张、0.00 元。合计行固定在 tfoot 中，客户原文即使就是
+    “合计”，也仍作为 tbody 中的独立客户行显示，不会被替换。
     """
     e = html.escape
     if records:
@@ -503,6 +507,18 @@ def render_report_html(records):
     else:
         rows_block = "  <tbody>\n  </tbody>\n"
         empty_notice = '  <p class="empty">没有匹配的报价</p>\n'
+
+    # 合计只统计 records（即本次筛选命中后分组的结果）：张数为各组张数之和，
+    # 金额为各组累计之和。Python 整数不受有符号 64 位限制，超出仍精确。
+    total_count = sum(count for _, count, _ in records)
+    total_amount = sum(subtotal for _, _, subtotal in records)
+    total_block = (
+        "  <tfoot>\n"
+        '    <tr><td>合计</td>'
+        f'<td class="num">{total_count}</td>'
+        f'<td class="num">{format_yuan(total_amount)}</td></tr>\n'
+        "  </tfoot>\n"
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -514,6 +530,7 @@ def render_report_html(records):
   th, td {{ border: 1px solid #999; padding: 0.4em 0.8em; }}
   .num {{ text-align: right; white-space: nowrap; }}
   tbody td:first-child {{ white-space: pre-wrap; }}
+  tfoot td {{ font-weight: bold; }}
   .empty {{ margin-top: 1em; }}
 </style>
 </head>
@@ -523,7 +540,7 @@ def render_report_html(records):
   <thead>
     <tr><th>客户</th><th>报价张数</th><th>累计金额（元）</th></tr>
   </thead>
-{rows_block}</table>
+{rows_block}{total_block}</table>
 {empty_notice}</body>
 </html>
 """
