@@ -469,6 +469,13 @@ def cmd_export(args):
 
 
 def cmd_report(args):
+    # 客户筛选值在访问数据库前校验：空字符串或纯空白直接拒绝，
+    # 即使数据库不存在也优先返回该错误；含有效文字时保留两端空白，
+    # 原样参与精确匹配。
+    customer_filter = args.customer
+    if customer_filter is not None and not customer_filter.strip():
+        return fail("客户筛选值不能为空白")
+
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
     try:
         conn = open_readonly_database(args.db)
@@ -487,7 +494,15 @@ def cmd_report(args):
                 )
             # 累计以已保存的报价合计为准，直接读取 total，不重新计算明细；
             # 每张报价只取一行，含多条明细也不会重复计数。
-            rows = conn.execute("SELECT customer, total FROM quotes").fetchall()
+            # 客户筛选用 = 精确比较（BINARY 排序规则）：大小写、首尾空格、
+            # 连续空格与换行都参与匹配，% 与 _ 按普通字符处理，不做归一化。
+            if customer_filter is None:
+                rows = conn.execute("SELECT customer, total FROM quotes").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT customer, total FROM quotes WHERE customer = ?",
+                    (customer_filter,),
+                ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -550,6 +565,11 @@ def build_parser():
         "report", help="按客户汇总报价张数与累计金额（只输出到标准输出）"
     )
     report_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    report_parser.add_argument(
+        "--customer",
+        default=None,
+        help="按客户名精确筛选（逐字符一致；省略时汇总全部客户）",
+    )
     report_parser.set_defaults(handler=cmd_report)
 
     return parser
