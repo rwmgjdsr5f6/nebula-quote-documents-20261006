@@ -1,305 +1,403 @@
-报价单保存与 HTML 预览流程说明（与冻结源码逐项核对）
+报价单保存与 HTML 预览流程说明（与当前源码逐项核对）
 ======================================================
 
 核对基准
 --------
-- 产品源码：quote.py（本仓库根目录，唯一可执行源码，全文 312 行）
+- 产品源码：quote.py（本仓库根目录，唯一可执行源码，当前全文 502 行）
 - 公开文档：README.md
-- 回归测试：tests/test_amount_flow.py（python3 -m unittest discover -s tests，4 个用例，核对时全部通过）
-- 存储：本地 SQLite 文件，由命令行 --db 指定路径；仓库内不附带任何数据库或业务数据
-- 本说明中的行号均以当前冻结版本 quote.py 为准；所有“实测”结果均为在仓库外临时目录用公开命令运行所得，产品源码、文档、数据库结构与数据未被修改。
+- 回归测试：tests/ 下 9 个文件共 59 个用例；本次核对时执行
+  python3 -m unittest discover -s tests，59 个全部通过（耗时约 26 秒）。
+- 存储：本地 SQLite 文件，由命令行 --db 指定路径；仓库内不附带任何数据库或业务数据。
+- 本说明中的行号均以当前 quote.py 为准。
+
+证据分级（本说明严格区分三类结论，不混用）
+  【源码】由当前 quote.py 源码直接推导的行为，标注函数名与行号。
+  【测试】已有回归测试覆盖的断言，标注测试文件与用例位置；测试数量与通过
+          情况以本次实际运行为准，不沿用旧记录。
+  【实测】本次核对在仓库外临时目录（/tmp）用公开命令实际运行得到的结果，
+          运行环境为 Linux / Python 3 / 标准库 sqlite3；产品源码、README、
+          其他文档与数据格式均未改动。凡未标【实测】的行为描述均不属于
+          本次执行记录。
 
 
 一、链路完整性结论
 ------------------
-“输入明细 JSON -> 保存到 SQLite -> 按编号取得 HTML 预览”这条链路在当前源码中**完整存在**，
-由 quote.py 的两个子命令 save 与 preview 构成，二者可在不同进程中运行：
+“输入明细 JSON -> 保存到 SQLite -> 按编号取得 HTML 预览”这条链路在当前源码中
+完整存在，由 quote.py 的子命令 save 与 preview 构成，二者可在不同进程中运行：
 
   保存：python3 quote.py save    --db <数据库路径> --input <JSON 路径>
   预览：python3 quote.py preview --db <数据库路径> --number <编号> --output <HTML 路径>
 
-公开入口与实际处理位置的对应关系：
+公开入口与实际处理位置的对应关系【源码】：
 
-  命令行入口（argparse 定义）  build_parser()   quote.py:286-301
-  分发                         main()           quote.py:304-307
-  save 的处理函数             cmd_save()       quote.py:137-187
-  preview 的处理函数          cmd_preview()    quote.py:242-283
-  文档中的入口说明            README.md:9-11（save）、README.md:34-36（preview）
+  命令行入口（argparse 定义）  build_parser()   quote.py:460-491
+  分发                         main()           quote.py:494-497
+  save 的处理函数             cmd_save()       quote.py:155-208
+  preview 的处理函数          cmd_preview()    quote.py:275-343
+  文档中的入口说明            README.md:9-11（save）、README.md:37-39（preview）
 
-save 内部各环节位置：
-  读取输入文件                cmd_save()            quote.py:139-142
-  解析 JSON                  cmd_save()            quote.py:145-147
-  输入校验与金额计算          validate_quote()      quote.py:66-124（调用点 quote.py:150）
-  打开/建库                   open_database()、ensure_schema()  quote.py:127-134、161-162
-  写入报价主表与明细          cmd_save()            quote.py:163-178
+save 内部各环节位置【源码】：
+  读取输入文件（UTF-8）       cmd_save()            quote.py:156-163
+  解析 JSON                  cmd_save()            quote.py:165-168
+  输入校验与金额计算          validate_quote()      quote.py:69-138（调用点 quote.py:170-173）
+  打开/建库与补列             open_database()、ensure_schema()
+                                                  quote.py:141-152（调用点 quote.py:176-183）
+  写入报价主表与明细          cmd_save()            quote.py:184-199
 
-preview 内部各环节位置：
-  输出目标占用检查            cmd_preview()         quote.py:244-245
-  以只读方式打开数据库        cmd_preview()         quote.py:248-251
-  按编号取报价主行            cmd_preview()         quote.py:252-260
-  按位置取明细行              cmd_preview()         quote.py:261-265
+preview 内部各环节位置【源码】：
+  输出目标占用检查            cmd_preview()         quote.py:276-278
+  以只读方式打开数据库        cmd_preview()         quote.py:280-284
+  按编号取报价主行（含旧库兼容）cmd_preview()       quote.py:285-301
+  按位置取明细行              cmd_preview()         quote.py:302-306
   渲染 HTML（含转义/金额换算）render_html()、format_yuan()、html.escape
-                                                   quote.py:190-239（调用点 quote.py:270）
-  独占新建输出文件            cmd_preview()         quote.py:273-280
+                                                  quote.py:211-272（调用点 quote.py:311）
+  独占新建输出文件并写出      cmd_preview()         quote.py:313-340
 
 
 二、输入格式（save）
 --------------------
-输入为 UTF-8 编码的 JSON 文件，根元素必须是对象（quote.py:72-73），必填字段
-（quote.py:75-77）：
+输入为 UTF-8 编码的 JSON 文件，根元素必须是对象【源码：quote.py:76-77】，
+必填字段【源码：quote.py:79-81】：
 
-  number   字符串，去除首尾空白后非空（require_nonblank_str，quote.py:58-63）
+  number   字符串，去除首尾空白后非空（require_nonblank_str，quote.py:61-66）
   customer 字符串，同上
-  items    数组，且至少 1 条（quote.py:83-86）
+  items    数组，且至少 1 条（quote.py:96-100）
 
-每个数组元素必须是对象（quote.py:91-92），必填字段（quote.py:93-95）：
+每个数组元素必须是对象（quote.py:105-106），必填字段（quote.py:107-109）：
 
-  description 字符串，去除首尾空白后非空（quote.py:97）
-  quantity    整数且不能是布尔值，必须 > 0（quote.py:99-103；is_plain_int 见 quote.py:53-55）
-  unit_price  整数且不能是布尔值，必须 >= 0（允许 0）（quote.py:105-109）
+  description 字符串，去除首尾空白后非空（quote.py:111）
+  quantity    整数且不能是布尔值，必须 > 0（quote.py:113-117；is_plain_int 见 quote.py:56-58）
+  unit_price  整数且不能是布尔值，必须 >= 0（允许 0）（quote.py:119-123）
 
-其他源码可证的输入行为：
-- “非空白”只用于判定合法性；合法文本原样保存，不做 trim。实测客户 "  张 三 " 与
-  说明 " 服务 " 入库后逐字符保留（依据 quote.py:58-63 只返回原值，写入为参数直传）。
-- 金额单位为“分”的整数（模块文档字符串 quote.py:8；README.md:28）。
+可选字段 note（客户说明）【源码：quote.py:86-94】：
+  - 省略 note 字段，或 note 为空字符串 ""：表示无说明，库中存 NULL
+    （quote.py:88、93-94；写入时 note=None 直传，quote.py:186-189）。
+  - note 为非空字符串（包括纯空白字符串）：原样保存，不做任何去除空白处理；
+    预览中转义后显示（见第五节）。纯空白字符串不是空字符串，不在归并之列。
+  - note 为 null 或任何其他非字符串值（数值、数组、对象、布尔等）：拒绝，
+    走 fail()，标准输出为空，标准错误为“错误: note 必须是字符串”，退出码 1
+    （quote.py:91-92、50-53）。此拒绝发生在打开数据库之前（校验在
+    quote.py:170-173，打开数据库在 quote.py:176-179），不创建数据库文件。
+    【实测】note 分别为 null 与数值 5 时，退出码均为 1，标准输出为空，
+    标准错误均为“错误: note 必须是字符串”，目标数据库文件未生成。
+    【测试】tests/test_note_flow.py:350（非法 note 类型拒绝且不建库）、
+    tests/test_note_flow.py:365（非法 note 不改动已有数据库）。
+
+其他源码可证的输入行为【源码】：
+- “非空白”只用于判定合法性；合法文本原样保存，不做 trim（quote.py:61-66
+  只返回原值，写入为参数直传，quote.py:186-199）。
+- 金额单位为“分”的整数（模块文档字符串 quote.py:10；README.md:31）。
 - 数量、单价的上界：quantity 或 unit_price 大于 INT64_MAX=(2**63-1) 即拒绝
-  （quote.py:19、111-112）。乘积与合计另行检查（见下节）。
+  （quote.py:21、125-126）。乘积与合计另行检查（见下节）。
 - JSON 中的 true/false 是布尔值，明确不算整数；1.5 这类浮点数也不算整数
-  （quote.py:53-55；tests/test_amount_flow.py:191-194）。
-- 输入中的额外字段（如 total、note）不参与任何处理，直接忽略；合计永远由源码计算，
-  不接受调用者提供（validate_quote 只读取上述已知字段，quote.py:66-124）。
+  （quote.py:56-58、113-123）。
+- 除 note 外的额外字段（如 total）不参与任何处理，直接忽略；合计永远由源码
+  计算，不接受调用者提供（validate_quote 只读取上述已知字段，quote.py:69-138）。
+- note 不参与金额计算：合计仅由明细行金额求和（quote.py:128-136），
+  note 在校验返回值中单独传递（quote.py:138）。
 - 对字符串长度、编号格式（无任何模式约束）、明细重复等均无检查（见第七节）。
 
 
 三、整数金额计算与保存
 ----------------------
-计算全部使用 Python 整数运算，不涉及浮点（quote.py:114-122）：
+计算全部使用 Python 整数运算，不涉及浮点【源码：quote.py:128-136】：
 
-  行合计 line_amount = quantity * unit_price           （quote.py:114）
-  单据合计 total      = 所有行 line_amount 之和         （quote.py:120）
+  行合计 line_amount = quantity * unit_price           （quote.py:128）
+  单据合计 total      = 所有行 line_amount 之和         （quote.py:134）
 
-  - 行合计 > INT64_MAX：拒绝，“行金额超出有符号64位整数范围”（quote.py:115-116）
-  - 合计   > INT64_MAX：拒绝，“合计金额超出有符号64位整数范围”（quote.py:121-122）
-  数量、单价本身超界的检查在乘积之前（quote.py:111-112）。因 quantity>0、
+  - 行合计 > INT64_MAX：拒绝，“行金额超出有符号64位整数范围”（quote.py:129-130）
+  - 合计   > INT64_MAX：拒绝，“合计金额超出有符号64位整数范围”（quote.py:135-136）
+  数量、单价本身超界的检查在乘积之前（quote.py:125-126）。因 quantity>0、
   unit_price>=0，不存在负金额，故源码没有也不需要负数下界检查。
 
-数据库结构（SCHEMA，quote.py:21-36；保存时由 ensure_schema 建表，quote.py:133-134）：
+数据库结构（SCHEMA，quote.py:23-39；保存时由 ensure_schema 建表，quote.py:147-148）：
 
-  quotes(number TEXT PRIMARY KEY, customer TEXT NOT NULL, total INTEGER NOT NULL)
+  quotes(number TEXT PRIMARY KEY, customer TEXT NOT NULL,
+         total INTEGER NOT NULL, note TEXT)
   items(id INTEGER PRIMARY KEY AUTOINCREMENT,
         quote_number TEXT NOT NULL REFERENCES quotes(number),
         position INTEGER NOT NULL, description TEXT NOT NULL,
         quantity INTEGER NOT NULL, unit_price INTEGER NOT NULL,
         line_amount INTEGER NOT NULL)
 
-  - 主表写入 number、customer、total（quote.py:165-168）。
-  - 明细写入 position（enumerate 从 0 开始，quote.py:171-178）、说明、数量、单价、行合计。
-  - 打开连接时执行 PRAGMA foreign_keys = ON（quote.py:129）。明细在同一事务内、
-    主行插入成功之后才插入（quote.py:163-178）。
+  - 主表写入 number、customer、total、note（quote.py:186-189）。
+  - 明细写入 position（enumerate 从 0 开始，quote.py:192-199）、说明、数量、
+    单价、行合计。
+  - 打开连接时执行 PRAGMA foreign_keys = ON（quote.py:143）。明细在同一事务内、
+    主行插入成功之后才插入（quote.py:184-199）。
 
-成功时的公开结果：标准输出打印编号（print(number)，quote.py:186），退出码 0。
-实测与 tests/test_amount_flow.py:122-138 一致：数量 2/1/4、单价 1250/300/0（分）
-得到行合计 2500/300/0、合计 2800（分），库内均为整数。
+旧库兼容（保存侧）【源码：quote.py:147-152】：
+  ensure_schema 在建表后检查 quotes 的列；旧库缺少 note 列时执行
+  ALTER TABLE quotes ADD COLUMN note TEXT 就地补列，已有报价的 note 为 NULL
+  （无说明），无需重建。补列与建表在独立事务中提交（quote.py:182-183），
+  先于主表/明细写入事务（quote.py:184-199）。
 
-编号如何确定：
-  编号**完全由输入 JSON 的 number 字段提供**，原样作为主键，源码中不存在任何
-  自动生成、自增、补零或查重后改名的逻辑（全文件仅一处 print(number) 输出它，
-  写入为直传；items.id 的 AUTOINCREMENT 是内部列，从不对外显示）。因此保存后
-  “可观察到的编号”就是输入里的编号字符串，没有动态编号规则可言。
+成功时的公开结果：标准输出打印编号（print(number)，quote.py:207），退出码 0。
+【测试】tests/test_amount_flow.py:115（正常流程保存后预览，含金额断言）。
+
+编号如何确定【源码】：
+  编号完全由输入 JSON 的 number 字段提供，原样作为主键，源码中不存在任何
+  自动生成、自增、补零或查重后改名的逻辑（全文件仅 quote.py:207 一处
+  print(number) 输出它，写入为直传；items.id 的 AUTOINCREMENT 是内部列，
+  从不对外显示）。因此保存后“可观察到的编号”就是输入里的编号字符串。
 
 
 四、同一编号再次保存的结果
 --------------------------
 quotes.number 是 PRIMARY KEY。重复保存同一编号时，主表 INSERT 触发
-sqlite3.IntegrityError，被转换为 DuplicateNumber（quote.py:169-170），
+sqlite3.IntegrityError，被转换为 DuplicateNumber（quote.py:190-191），
 最终走 fail()：标准错误输出“错误: 报价编号已存在: <编号>”，退出码 1，
-标准输出为空（quote.py:179-180、47-50）。
+标准输出为空（quote.py:200-201、50-53）。
 
-该 INSERT 位于 with conn 事务中（quote.py:163），失败即回滚，明细的
-executemany 不会执行。实测对同一编号第二次 save 后，库中 quotes 与 items
-均仍只有原 1 行；回归测试 tests/test_amount_flow.py:211-257 也断言无效或重复
-提交后已有数据库内容逐字节不变。当前源码**没有更新/覆盖已存报价单的入口**。
+该 INSERT 位于 with conn 事务中（quote.py:184），失败即回滚，明细的
+executemany 不会执行，本次报价主行与明细均不写入，已有数据不变。
+【测试】tests/test_duplicate_flow.py:244（重复提交被拒、原报价保持完整）、
+tests/test_amount_flow.py:330（被拒的保存不改动已有数据库）。
+当前源码没有更新/覆盖已存报价单的入口。
+
+旧库上的重复保存（边界细节）【源码 + 实测】：
+  对缺少 note 列的旧库执行 save 时，补列事务（quote.py:182-183）先于写入
+  事务提交。若随后主表 INSERT 因编号重复失败，回滚的只是写入事务；
+  已经提交的补列不会撤销——库中此后带有 note 列，但本次报价与明细均未写入。
+  【实测】在只有 number/customer/total 三列、含一条旧报价的旧库上：第一次
+  save 新编号成功后 quotes 出现 note 列；再用同一编号 save，退出码 1，
+  标准错误“错误: 报价编号已存在: <编号>”，库中报价行数与明细行数不变，
+  note 列保留。
 
 
 五、预览流程（preview）与数据来源
 ---------------------------------
-处理顺序（quote.py:242-283）：
+处理顺序【源码：quote.py:275-343】：
 
-1. 输出目标已存在 -> 立即拒绝（quote.py:244-245）。此检查在打开数据库之前，
-   故“输出已存在”优先于“编号不存在”。实测两者同时成立时报“输出文件已存在”。
-2. 以只读 URI 打开数据库：file:<绝对路径>?mode=ro（quote.py:248-250）。
+1. 输出目标已存在 -> 立即拒绝（quote.py:276-278）。此检查在打开数据库之前，
+   故“输出已存在”优先于“编号不存在”。
+2. 以只读 URI 打开数据库：file:<绝对路径>?mode=ro（quote.py:280-284）。
    数据库文件不存在或不可访问时抛 sqlite3.Error，报“无法读取数据库 ...”，
-   退出码 1，且不创建数据库文件、不创建输出文件（实测）。
-3. 按编号原文精确匹配取主行：SELECT customer, total FROM quotes WHERE number=?
-   （quote.py:252-256）。查不到 -> “错误: 报价编号不存在: <编号>”，退出码 1，
-   不产生输出文件（quote.py:257-259）。
+   退出码 1，且不创建数据库文件、不创建输出文件。
+3. 按编号原文精确匹配取主行（quote.py:285-301）。旧库兼容：先查
+   PRAGMA table_info(quotes)，有 note 列则 SELECT customer, total, note，
+   否则 SELECT customer, total, NULL（quote.py:285-296）——旧库缺少 note 列
+   时可直接预览，一律按无说明处理，只读打开不补列、不改动库结构。
+   【实测】对无 note 列的旧库直接 preview 成功（退出码 0），生成页面无
+   “客户说明”区域，预览后库结构仍只有 number/customer/total 三列。
+   【测试】tests/test_note_flow.py:487（旧库先预览再带说明保存）。
+   查不到编号 -> “错误: 报价编号不存在: <编号>”，退出码 1，
+   不产生输出文件（quote.py:297-300）。
 4. 取明细：SELECT description, quantity, unit_price, line_amount FROM items
-   WHERE quote_number=? ORDER BY position（quote.py:261-265），即严格按保存时的
+   WHERE quote_number=? ORDER BY position（quote.py:302-306），即严格按保存时的
    输入顺序（position 升序）。
-5. render_html() 渲染（quote.py:195-239），再以 os.open(..., O_WRONLY|O_CREAT|
-   O_EXCL) 独占新建输出文件（quote.py:273-278）。O_EXCL 是并发兜底：目标存在
-   绝不覆盖。成功后标准输出输出路径，退出码 0（quote.py:282）。
+5. render_html() 渲染（quote.py:216-272），再以 os.open(..., O_WRONLY|O_CREAT|
+   O_EXCL) 独占新建输出文件（quote.py:313-317）。O_EXCL 是并发兜底：目标存在
+   绝不覆盖。写循环处理部分写入（quote.py:319-340）。成功后标准输出输出路径，
+   退出码 0（quote.py:342）。
 
-预览内容取自哪份数据：
-  客户、合计取自 quotes 行；说明、数量、单价、行合计全部取自 items 行
-  （quote.py:253、261-265、270）。也就是说预览只反映**此前已保存**的数据，
+预览内容取自哪份数据【源码】：
+  客户、合计、说明取自 quotes 行；说明、数量、单价、行合计全部取自 items 行
+  （quote.py:288-306、311）。也就是说预览只反映此前已保存的数据，
   保存与预览之间没有任何内存态共享。唯一例外是页面中的“编号”：渲染用的是
-  命令行传入的 args.number（quote.py:270），不是库内回读值；由于查询本身按该
+  命令行传入的 args.number（quote.py:311），不是库内回读值；由于查询本身按该
   值精确匹配，正常情况下二者必然相同。
 
-HTML 文本转义发生的位置：
-  render_html 内把 html.escape 别名为 e（quote.py:196），作用于全部用户文本：
-  - <title> 中的编号（quote.py:211）
-  - 正文中的编号（quote.py:223）
-  - 客户（quote.py:224）
-  - 每条明细的说明（quote.py:201）
-  数量与金额是整数经格式函数生成，不经转义。Python 标准库 html.escape 默认
-  quote=True：转义 & < >，并把 " 转成 &quot;、' 转成 &#x27;。实测
-  “<演示客户&Co>”显示源文为 &lt;演示客户&amp;Co&gt;，“<零件>”为
-  &lt;零件&gt;，页面渲染时显示原文，不产生标签或脚本。
+说明（note）在页面中的位置与形态【源码：quote.py:228-239】：
+  说明非空时，在客户信息（<dl>）之后、明细表格（<table>）之前出现
+  “客户说明”区域（quote.py:259 的 {note_section} 位置），正文放在
+  <p class="note-text"> 内，样式 white-space: pre-wrap（quote.py:233）
+  保留空格与换行；说明文本经 html.escape 转义（quote.py:237）。
+  说明为 NULL（省略或空字符串保存的）时不出现该区域，页面其余内容与样式
+  与无说明情形一致（quote.py:230-232）。
+  【测试】tests/test_note_flow.py:221（保存后预览的说明往返）、
+  tests/test_note_flow.py:263（省略/空说明不出现该区域）、
+  tests/test_note_flow.py:290（纯空白说明照样保存并显示）。
 
-金额换算（分 -> 元）：
-  format_yuan(cents) = f"{cents // 100}.{cents % 100:02d}"（quote.py:190-192），
+HTML 文本转义发生的位置【源码】：
+  render_html 内把 html.escape 别名为 e（quote.py:217），作用于全部用户文本：
+  - <title> 中的编号（quote.py:244）
+  - 正文中的编号（quote.py:256）
+  - 客户（quote.py:257）
+  - 说明 note（quote.py:237）
+  - 每条明细的说明（quote.py:221）
+  数量与金额是整数经格式函数生成，不经转义。Python 标准库 html.escape 默认
+  quote=True：转义 & < >，并把 " 转成 &quot;、' 转成 &#x27;。
+  【测试】tests/test_preview_flow.py:128（用户文本转义）。
+
+金额换算（分 -> 元）【源码】：
+  format_yuan(cents) = f"{cents // 100}.{cents % 100:02d}"（quote.py:211-213），
   纯整数除法与取模，保留两位小数，无浮点。单价、行合计、总计三处都经此函数
-  （quote.py:202-203、234）。实测 1250 分显示 12.50，2500 分显示 25.00；
-  边界 INT64_MAX 分显示 92233720368547758.07（tests/test_amount_flow.py:165-183）。
-  表格行号为 position+1（首行显示 1，quote.py:199）。
+  （quote.py:223-224、267）。
+  【测试】tests/test_amount_flow.py:165（INT64_MAX 边界换算往返）。
+  表格行号为 position+1（首行显示 1，quote.py:220）。
 
 
 六、同一编号再次生成预览的结果
 ------------------------------
-- 输出到**同一路径**：因目标已存在，在查库之前即被拒绝，“错误: 输出文件已存在:
-  <路径>”，退出码 1，原文件保持不变（quote.py:244-245；实测一致）。
-- 输出到**新的路径**：成功，退出码 0。内容完全由库内已保存数据重新渲染；实测
-  两次生成的文件逐字节相同（diff 无差异）。预览本身不写数据库，重复预览不会
-  改变任何数据（只读打开，quote.py:248-250）。
+- 输出到同一路径：因目标已存在，在查库之前即被拒绝，“错误: 输出文件已存在:
+  <路径>”，退出码 1，原文件保持不变（quote.py:276-278）。
+- 输出到新的路径：成功，退出码 0。内容完全由库内已保存数据重新渲染。
+  预览本身不写数据库，重复预览不会改变任何数据（只读打开，quote.py:280-284）。
+  【测试】tests/test_preview_flow.py:226（新路径内容一致、已存在或未知编号被拒）。
 - 不存在“重新计算”：预览显示的行合计/合计是保存时落库的整数值，不是预览时
-  重新相乘得到（SQL 直接读 line_amount、total，quote.py:253、262）。
+  重新相乘得到（SQL 直接读 line_amount、total，quote.py:288-306）。
 
 
 七、异常情形对照（真实异常类型 -> 公开可见结果）
 ------------------------------------------------
 统一出口 fail(message)：向 stderr 打印“错误: <原因>”，返回退出码 1
-（quote.py:47-50）。参数层面的错误由 argparse 处理，退出码 2。
+（quote.py:50-53）。参数层面的错误由 argparse 处理，退出码 2。
 
 情形                              处理与异常类型                 公开结果（stderr / 退出码 / 副作用）   源码依据
 ----------------------------------------------------------------------------------------------------------------
-明细为空（items: []）             ValidationError               “错误: 明细不能为空”；1；不建库        quote.py:85-86
-数量为 0 或负数                   ValidationError               “错误: 第 N 条明细的数量必须是正整数”；1；不建库 quote.py:102-103
-单价为负数                        ValidationError               “错误: 第 N 条明细的单价必须为非负整数”；1      quote.py:108-109
-数量/单价为布尔值                 ValidationError               “……必须是整数（布尔值不算整数）”；1            quote.py:53-55、100-107
-数量/单价为浮点数或字符串         ValidationError               同上“必须是整数”；1（实测 1.5、12.5 被拒）     quote.py:100-107
-数量或单价 > INT64_MAX            ValidationError               “……数量或金额超出有符号64位整数范围”；1        quote.py:111-112
-行乘积 > INT64_MAX                ValidationError               “……行金额超出有符号64位整数范围”；1            quote.py:114-116
-合计 > INT64_MAX                  ValidationError               “错误: 合计金额超出有符号64位整数范围”；1      quote.py:120-122
-number/customer/description 空白  ValidationError               “……不能只有空白”；1                            quote.py:58-63
-根元素不是对象/缺字段/元素非对象  ValidationError               对应中文原因；1；不建库                         quote.py:72-77、91-95
-JSON 语法错误                     json.JSONDecodeError 被捕获   “错误: JSON 解析失败: ……”；1；不建库          quote.py:145-147
-输入文件不可读/不存在             OSError 被捕获                “错误: 无法读取输入文件 ……”；1                quote.py:139-142
-重复编号                          sqlite3.IntegrityError ->     “错误: 报价编号已存在: <编号>”；1；事务回滚，   quote.py:165-180
-                                  DuplicateNumber               不留本次主行/明细，旧数据不变
-save 时数据库无法打开（含目录不存在） sqlite3.Error 被捕获       “错误: 无法打开数据库 ……”；1                  quote.py:156-158
-其他数据库写入失败                sqlite3.Error 被捕获          “错误: 数据库写入失败: ……”；1                  quote.py:181-182
-预览编号未知                      查询返回 None                “错误: 报价编号不存在: <编号>”；1；不建输出文件 quote.py:256-259
-预览输出路径已存在                打开库前先检查 os.path.exists “错误: 输出文件已存在: ……”；1；不覆盖          quote.py:244-245
-预览数据库不存在/不可读           sqlite3.Error（只读 URI）     “错误: 无法读取数据库 ……”；1；不建库不建输出   quote.py:248-268
-预览输出目录不存在                os.open 抛 OSError 被捕获     “错误: 无法写入输出文件 ……: [Errno 2] ……”；1  quote.py:273-280
-缺少必填命令行参数/无子命令       argparse 报错                 usage 文本；退出码 2（实测）                    quote.py:286-301
+明细为空（items: []）             ValidationError               “错误: 明细不能为空”；1；不建库        quote.py:99-100
+数量为 0 或负数                   ValidationError               “错误: 第 N 条明细的数量必须是正整数”；1；不建库 quote.py:116-117
+单价为负数                        ValidationError               “错误: 第 N 条明细的单价必须为非负整数”；1      quote.py:122-123
+数量/单价为布尔值                 ValidationError               “……必须是整数（布尔值不算整数）”；1            quote.py:56-58、113-123
+数量/单价为浮点数或字符串         ValidationError               同上“必须是整数”；1                        quote.py:113-123
+数量或单价 > INT64_MAX            ValidationError               “……数量或金额超出有符号64位整数范围”；1        quote.py:125-126
+行乘积 > INT64_MAX                ValidationError               “……行金额超出有符号64位整数范围”；1            quote.py:128-130
+合计 > INT64_MAX                  ValidationError               “错误: 合计金额超出有符号64位整数范围”；1      quote.py:134-136
+number/customer/description 空白  ValidationError               “……不能只有空白”；1                            quote.py:61-66
+note 为 null 或非字符串           ValidationError               “错误: note 必须是字符串”；1；不建库           quote.py:91-92
+根元素不是对象/缺字段/元素非对象  ValidationError               对应中文原因；1；不建库                         quote.py:76-81、105-109
+JSON 语法错误                     json.JSONDecodeError 被捕获   “错误: JSON 解析失败: ……”；1；不建库          quote.py:165-168
+输入文件不是合法 UTF-8            UnicodeDecodeError 被捕获     “错误: 输入文件不是有效的 UTF-8: <输入路径>”； quote.py:156-163
+                                                                1；标准输出为空；拒绝发生在打开数据库之前，
+                                                                不创建数据库文件
+输入文件不可读/不存在             OSError 被捕获                “错误: 无法读取输入文件 ……”；1                quote.py:156-160
+重复编号                          sqlite3.IntegrityError ->     “错误: 报价编号已存在: <编号>”；1；写入事务回滚， quote.py:184-201
+                                  DuplicateNumber               不留本次主行/明细，旧数据不变；
+                                                                旧库上已提交的补列不撤销（见第四节）
+save 时数据库无法打开（含目录不存在） sqlite3.Error 被捕获       “错误: 无法打开数据库 ……”；1                  quote.py:176-179
+其他数据库写入失败                sqlite3.Error 被捕获          “错误: 数据库写入失败: ……”；1                  quote.py:202-203
+预览编号未知                      查询返回 None                “错误: 报价编号不存在: <编号>”；1；不建输出文件 quote.py:297-300
+预览输出路径已存在                打开库前先检查 os.path.exists “错误: 输出文件已存在: ……”；1；不覆盖          quote.py:276-278
+预览数据库不存在/不可读           sqlite3.Error（只读 URI）     “错误: 无法读取数据库 ……”；1；不建库不建输出   quote.py:280-309
+预览输出目录不存在                os.open 抛 OSError 被捕获     “错误: 无法写入输出文件 ……: [Errno 2] ……”；1  quote.py:313-317
+缺少必填命令行参数/无子命令       argparse 报错                 usage 文本；退出码 2                        quote.py:460-491
 
-源码**没有**专门处理、因此不享受“错误:”约定的情况（实测，明确列出，不虚构约定）：
-- 输入文件不是合法 UTF-8：open(..., encoding="utf-8") 读取时抛 UnicodeDecodeError。
-  它不属于被捕获的 json.JSONDecodeError 或 OSError，进程以**未捕获异常的
-  traceback** 结束、退出码 1，stderr 没有“错误:”前缀；数据库尚未打开，不留库文件。
-  这是输入侧唯一观察到的 traceback 出口（quote.py:139-147 的捕获范围决定）。
-- 对编号/文本的长度与字符集、items 内重复明细、number 的格式模式，均无任何校验
-  （validate_quote 中没有相应代码）。
-- preview 的 --number 不做格式校验，直接原文精确匹配（quote.py:252-256、297）。
-- --output 不校验扩展名或内容类型（quote.py:298 仅要求提供该参数）。
+【测试】tests/test_amount_flow.py:187（各类非法输入被拒）、
+tests/test_amount_flow.py:302（非法 UTF-8 在各参数位置被拒）、
+tests/test_amount_flow.py:324（编码错误先于数据库错误）、
+tests/test_save_failure_flow.py:215（明细写入失败整体回滚后可重试）。
 
-尚未实现的能力（在 quote.py 与 README.md 中均无对应代码或入口，不代为设计）：
-- 报价单的修改、更新保存、删除；编号自动生成；报价单列表/查询全部报价；
-  除“按编号取单个 HTML”之外的其他输出形式。save 仅支持 INSERT 新编号，
-  preview 仅支持按主键读取并落一个新 HTML 文件。
+源码没有专门约束、因此不构成“错误:”情形的行为【源码】：
+- 对编号/文本的长度与字符集、items 内重复明细、number 的格式模式，均无任何
+  校验（validate_quote 中没有相应代码，quote.py:69-138）。
+- preview 的 --number 不做格式校验，直接原文精确匹配（quote.py:288-296、471）。
+- --output 不校验扩展名或内容类型（quote.py:472 仅要求提供该参数）。
 
 
 八、文档（README.md）与源码并列对照
 -----------------------------------
 两者主线一致，以下逐条并列，实际结果一律以源码为准：
 
-1. README.md:28 称“数量及各项金额超出 SQLite 有符号 64 位整数范围时拒绝保存”。
-   源码依据 quote.py:111-122：实际是分别对 quantity、unit_price、乘积
-   line_amount、求和 total 做 4 道 > INT64_MAX 检查；因数量与单价已限定非负，
+1. README.md:27-29 称 number/customer 为非空白字符串、合法文本原样保留，
+   note 省略或空字符串表示无说明、非空内容原样保存且不参与金额计算。
+   源码依据 quote.py:61-66、86-94、128-138，一致。
+2. README.md:32 称“数量及各项金额超出 SQLite 有符号 64 位整数范围时拒绝保存”。
+   源码依据 quote.py:125-136：分别对 quantity、unit_price、乘积 line_amount、
+   求和 total 做 4 道 > INT64_MAX 检查；因数量与单价已限定非负，
    没有负向下界检查。描述与实现一致。
-2. README.md:13 称输入为 UTF-8 JSON。源码确实以 encoding="utf-8" 打开
-   （quote.py:139），但非 UTF-8 字节产生的是未捕获 UnicodeDecodeError
-   traceback，而非 README.md:30 所述“标准错误说明原因”的“错误:”式消息。
-   以实现为准的实际结果见第七节。
-3. README.md:30 称重复编号或输入无效时“不留下本次数据”。源码依据：校验全部
-   通过后才打开数据库（quote.py:154-156），重复编号在事务内回滚
-   （quote.py:163-180）；实测与 tests/test_amount_flow.py:211-257 均确认。
-4. README.md:40-41 称用户文本均做 HTML 转义、金额分转元两位小数、编号原文精确
-   匹配。源码依据 quote.py:196-224、190-192、252-256，实测一致。
-5. README.md:42 称编号不存在、输出文件已存在或访问失败时非零退出且前两种情况
-   不创建/覆盖目标文件。源码依据 quote.py:244-245、257-259、273-278，实测一致；
+3. README.md:13 称输入为 UTF-8 JSON。源码以 encoding="utf-8" 打开并捕获
+   UnicodeDecodeError（quote.py:156-163），报“错误: 输入文件不是有效的
+   UTF-8: <路径>”，属于 README.md:33 所述“标准错误说明原因”的范畴，
+   拒绝发生在打开数据库之前（quote.py:170-179 的顺序）。
+4. README.md:33 称重复编号或输入无效时“不留下本次数据”。源码依据：校验全部
+   通过后才打开数据库（quote.py:170-179），重复编号在写入事务内回滚
+   （quote.py:184-201）；注意旧库补列属另一事务，不在“本次数据”之列
+   （见第四节）。
+5. README.md:41-45 称预览含编号、客户、按输入顺序的明细与各项金额，说明
+   区域位于客户信息之后、明细表格之前，用户文本均做 HTML 转义，金额分转元
+   两位小数，编号原文精确匹配。源码依据 quote.py:228-267、211-213、
+   285-306，一致。
+6. README.md:46 称编号不存在、输出文件已存在或访问失败时非零退出且前两种
+   情况不创建/覆盖目标文件。源码依据 quote.py:276-278、297-300、313-317；
    补充一点文档未写明的顺序事实：输出已存在的检查先于查库。
-6. README.md:44 称预览只读取已保存内容。源码依据：只读 URI 打开（quote.py:248）
-   且仅执行 SELECT；唯一非库内值是命令行传入的编号本身（quote.py:270）。
+7. README.md:48-49 称预览只读取已保存内容、旧库无需重建（保存时自动补
+   说明列，已有报价按无说明处理，可直接预览）。源码依据：只读 URI 打开
+   （quote.py:280-284）且仅执行 SELECT；ensure_schema 的补列
+   （quote.py:147-152）；preview 对无 note 列旧库的 NULL 兼容查询
+   （quote.py:285-296）。
 
 
-九、合成样例（端到端核对）
---------------------------
-下列输入当前实现完全支持。客户文本含 <演示客户&Co>，明细名称含 <零件>，
-数量 2、单价 1250（分，即整数最小单位）。
+九、合成样例（端到端核对，本次实际执行）
+----------------------------------------
+下列输入当前实现完全支持。客户文本含 <甲>&乙，note 含首尾空格与换行，
+两条明细分别为数量 2、单价 1250 分与数量 1、单价 300 分。
 
 输入文件 quote.json（UTF-8）：
 
 {
-  "number": "Q-SYNTH-001",
-  "customer": "<演示客户&Co>",
+  "number": "Q-DOC-001",
+  "customer": "<甲>&乙",
+  "note": "  含税价\n含运费  ",
   "items": [
-    {"description": "<零件>", "quantity": 2, "unit_price": 1250}
+    {"description": "零件A", "quantity": 2, "unit_price": 1250},
+    {"description": "零件B", "quantity": 1, "unit_price": 300}
   ]
 }
 
 调用方式（在仓库根目录；数据库与输出路径可任指空目录）：
 
   python3 quote.py save    --db demo.sqlite --input quote.json
-  python3 quote.py preview --db demo.sqlite --number Q-SYNTH-001 --output preview.html
+  python3 quote.py preview --db demo.sqlite --number Q-DOC-001 --output preview.html
 
-实测可观察结果：
-  save    退出码 0，stdout 仅一行：Q-SYNTH-001
-  preview 退出码 0，stdout 仅一行：preview.html；生成 UTF-8 HTML 文件
+【实测】可观察结果（本次在 /tmp 临时目录运行）：
+  save    退出码 0，stdout 仅一行：Q-DOC-001，stderr 为空
+  preview 退出码 0，stdout 仅一行：preview.html，stderr 为空；生成 UTF-8 HTML
 
-编号：Q-SYNTH-001 就是输入 number 的原文，不是动态生成（核对 quote.py:79、
-166、186——无任何编号生成代码）。
+编号：Q-DOC-001 就是输入 number 的原文，不是动态生成【源码：quote.py:83、
+186-189、207——无任何编号生成代码】。
 
 金额（规则与结果）：
-  行合计 = 2 × 1250 = 2500（分）   依据 quote.py:114
-  合计   = 2500（分，仅一行）       依据 quote.py:120
-  HTML 显示：单价 1250 -> 12.50 元；行合计 2500 -> 25.00 元；总计 25.00 元
-            依据 quote.py:190-192（//100 与 %100 两位补零）、202-203、234
-  数量列显示整数 2；行号列显示 1（position 0 + 1） 依据 quote.py:199、202
+  行合计 = 2 × 1250 = 2500；1 × 300 = 300（分）   依据 quote.py:128
+  合计   = 2500 + 300 = 2800（分）                 依据 quote.py:134
+  【实测】库内 quotes.total = 2800（整数分）；items 两行为
+  (position 0, 零件A, 2, 1250, 2500)、(position 1, 零件B, 1, 300, 300)，
+  note 列为原文 "  含税价\n含运费  "（首尾空格与换行逐字符保留）。
+  HTML 显示：单价 12.50、3.00 元；行金额 25.00、3.00 元；总计 28.00 元
+            依据 quote.py:211-213（//100 与 %100 两位补零）、223-224、267
+  数量列显示整数 2、1；行号列显示 1、2（position 0/1 + 1） 依据 quote.py:220-222
 
-文本转义（实测 HTML 源文中的确定结果）：
-  客户：&lt;演示客户&amp;Co&gt;   依据 quote.py:224 调用 html.escape
-  说明：&lt;零件&gt;             依据 quote.py:201
-  编号在 <title> 与正文各出现一次，原样 Q-SYNTH-001  依据 quote.py:211、223
+文本转义（【实测】生成 HTML 源文中的关键片段）：
+  客户（quote.py:257 调用 html.escape）：
+      <dt>客户</dt><dd>&lt;甲&gt;&amp;乙</dd>
+  说明区域（quote.py:233-239；首尾空格与换行保留，pre-wrap 样式生效）：
+      .note-text { white-space: pre-wrap; }
+      <section class="note">
+        <h2>客户说明</h2>
+        <p class="note-text">  含税价
+      含运费  </p>
+      </section>
+    该区域位于客户 <dl> 之后、明细 <table> 之前（quote.py:259）。
+  明细行（quote.py:218-227）：
+      <tr><td>1</td><td>零件A</td><td class="num">2</td><td class="num">12.50</td><td class="num">25.00</td></tr>
+      <tr><td>2</td><td>零件B</td><td class="num">1</td><td class="num">3.00</td><td class="num">3.00</td></tr>
+  总计行（quote.py:267）：
+      <tr><td colspan="4">总计（元）</td><td class="num">28.00</td></tr>
+  编号在 <title> 与正文各出现一次，原样 Q-DOC-001（quote.py:244、256）。
 
 如何顺着源码复核这一结果：
-  校验/计算：validate_quote quote.py:66-124（重点 99-122）
-  落库：quote.py:165-178；可用 sqlite3 直查 quotes.total=2500、
-        items=(position0, "<零件>", 2, 1250, 2500)（tests:73-88 有同款查法）
-  取数：quote.py:252-265
-  渲染：render_html quote.py:195-239；转义别名 e 定义于 196 行
-  也可直接运行 python3 -m unittest discover -s tests，其中
-  test_normal_flow_save_then_preview（tests:115-163）覆盖 2×1250=2500、
-  合计 2800 与 12.50/25.00/28.00 的显示断言。
+  校验/计算：validate_quote quote.py:69-138（重点 86-136）
+  落库：quote.py:182-199；可用 sqlite3 直查 quotes.total=2800、items 两行
+  取数：quote.py:285-306
+  渲染：render_html quote.py:216-272；转义别名 e 定义于 217 行
+  也可运行 python3 -m unittest discover -s tests（本次运行 59 个用例全部通过），
+  其中 tests/test_amount_flow.py:115 覆盖 2×1250 与 1×300 的保存后预览断言，
+  tests/test_note_flow.py:221 覆盖说明的保存后预览往返。
 
 再次操作的边界（同一样例）：
-  - 用同一 JSON 再跑一次 save：拒绝，“错误: 报价编号已存在: Q-SYNTH-001”，
-    退出码 1，库内仍只有 1 张报价、1 条明细（quote.py:169-180）。
+  - 用同一 JSON 再跑一次 save：拒绝，“错误: 报价编号已存在: Q-DOC-001”，
+    退出码 1，本次主行与明细均不写入（quote.py:184-201）。
   - 再跑 preview 指向同一 preview.html：拒绝，“错误: 输出文件已存在”，退出码 1
-    （quote.py:244-245）；换一个新 --output 路径则成功，且内容与首份逐字节相同，
-    因为内容只来自库内已保存行（quote.py:248-270）。
+    （quote.py:276-278）；换一个新 --output 路径则成功，内容只来自库内已保存行
+    （quote.py:280-311）。
   - 把 --number 换成未保存过的值：拒绝，“错误: 报价编号不存在: ……”，退出码 1，
-    不生成文件（quote.py:257-259）。
+    不生成文件（quote.py:297-300）。
+
+
+十、其他子命令的说明
+--------------------
+quote.py 当前还提供 list（列出摘要，cmd_list，quote.py:346-383）与
+export（按编号导出 JSON，cmd_export，quote.py:386-457）两个子命令，
+入口定义见 quote.py:475-489，README.md:5、51-72 有对应说明。
+本次修订只核对保存到预览的链路；list 与 export 已存在且本次行为不变，
+其流程不在本说明范围内，不展开。
