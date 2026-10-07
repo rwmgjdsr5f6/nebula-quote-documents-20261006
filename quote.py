@@ -267,6 +267,9 @@ def render_html(number, customer, note, items, total):
     )
     # 有说明时在客户信息之后、明细表格之前展示；pre-wrap 保留空格与换行。
     # 无说明时不出现该区域，页面其余内容与样式与原先逐字节一致。
+    # 编号、客户与明细说明同样以 pre-wrap 展示：首尾空格、连续空格与换行
+    # （含连续换行形成的空行）按原样呈现；多行客户仍在客户信息区域，
+    # 多行说明仍在同一行明细的单元格内，不拆出新的表格行。
     note_style = ""
     note_section = ""
     if note:
@@ -287,7 +290,9 @@ def render_html(number, customer, note, items, total):
   table {{ border-collapse: collapse; margin-top: 1em; }}
   th, td {{ border: 1px solid #999; padding: 0.4em 0.8em; }}
   .num {{ text-align: right; white-space: nowrap; }}
-  tfoot td {{ font-weight: bold; }}{note_style}
+  tfoot td {{ font-weight: bold; }}
+  dl dd {{ white-space: pre-wrap; }}
+  tbody td:nth-child(2) {{ white-space: pre-wrap; }}{note_style}
 </style>
 </head>
 <body>

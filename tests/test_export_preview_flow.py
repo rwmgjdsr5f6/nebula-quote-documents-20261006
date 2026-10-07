@@ -74,6 +74,8 @@ EXPECTED_MAIN_DOCUMENT = """<!DOCTYPE html>
   th, td { border: 1px solid #999; padding: 0.4em 0.8em; }
   .num { text-align: right; white-space: nowrap; }
   tfoot td { font-weight: bold; }
+  dl dd { white-space: pre-wrap; }
+  tbody td:nth-child(2) { white-space: pre-wrap; }
   .note-text { white-space: pre-wrap; }
 </style>
 </head>
@@ -115,6 +117,8 @@ EXPECTED_NO_NOTE_DOCUMENT = """<!DOCTYPE html>
   th, td { border: 1px solid #999; padding: 0.4em 0.8em; }
   .num { text-align: right; white-space: nowrap; }
   tfoot td { font-weight: bold; }
+  dl dd { white-space: pre-wrap; }
+  tbody td:nth-child(2) { white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -150,6 +154,8 @@ EXPECTED_WHITESPACE_NOTE_DOCUMENT = """<!DOCTYPE html>
   th, td { border: 1px solid #999; padding: 0.4em 0.8em; }
   .num { text-align: right; white-space: nowrap; }
   tfoot td { font-weight: bold; }
+  dl dd { white-space: pre-wrap; }
+  tbody td:nth-child(2) { white-space: pre-wrap; }
   .note-text { white-space: pre-wrap; }
 </style>
 </head>
@@ -191,6 +197,8 @@ EXPECTED_INT64_DOCUMENT = """<!DOCTYPE html>
   th, td { border: 1px solid #999; padding: 0.4em 0.8em; }
   .num { text-align: right; white-space: nowrap; }
   tfoot td { font-weight: bold; }
+  dl dd { white-space: pre-wrap; }
+  tbody td:nth-child(2) { white-space: pre-wrap; }
 </style>
 </head>
 <body>

@@ -39,6 +39,18 @@ ESCAPED_DESC_PLAIN = "资料 &amp; 支持"
 
 UNKNOWN_NUMBER = "Q-MISSING-000"
 
+# ---- 空白保留样例：编号、客户与说明含首尾空格、连续空格、换行与连续换行 ----
+
+WS_NUMBER = " Q  WHITE-001 "
+WS_CUSTOMER = "  演示  <甲>&乙\n第二行  "
+WS_DESC_MULTILINE = "  咨询  &lt;资料&gt;\n补充  "
+WS_DESC_BLANK_LINES = "<script>示例</script>\n\n\n末行"
+
+ESCAPED_WS_NUMBER = " Q  WHITE-001 "
+ESCAPED_WS_CUSTOMER = "  演示  &lt;甲&gt;&amp;乙\n第二行  "
+ESCAPED_WS_DESC_MULTILINE = "  咨询  &amp;lt;资料&amp;gt;\n补充  "
+ESCAPED_WS_DESC_BLANK_LINES = "&lt;script&gt;示例&lt;/script&gt;\n\n\n末行"
+
 
 def make_payload():
     return {
@@ -220,6 +232,88 @@ class PreviewFlowTestCase(unittest.TestCase):
         # 第二条明细的单价与行金额都是 3.00，应恰好出现两次。
         self.assertEqual(document.count('<td class="num">3.00</td>'), 2)
         self.assertIn('<td class="num">28.00</td>', document, msg="总计应显示 28.00")
+
+    # ---- 空白保留：编号、客户、说明中的空格与换行按原样呈现 ----
+
+    def test_preview_preserves_whitespace_and_newlines(self):
+        # 期望常量自检：它们确实是标准库对用户原文的转义结果，防止测试常量写错。
+        self.assertEqual(html.escape(WS_NUMBER), ESCAPED_WS_NUMBER)
+        self.assertEqual(html.escape(WS_CUSTOMER), ESCAPED_WS_CUSTOMER)
+        self.assertEqual(html.escape(WS_DESC_MULTILINE), ESCAPED_WS_DESC_MULTILINE)
+        self.assertEqual(html.escape(WS_DESC_BLANK_LINES), ESCAPED_WS_DESC_BLANK_LINES)
+
+        payload = {
+            "number": WS_NUMBER,
+            "customer": WS_CUSTOMER,
+            "items": [
+                {"description": WS_DESC_MULTILINE, "quantity": 2, "unit_price": 1250},
+                {"description": WS_DESC_BLANK_LINES, "quantity": 1, "unit_price": 300},
+            ],
+        }
+        save_result, db_path = self.save(payload)
+        self.assertEqual(save_result.returncode, 0, msg=save_result.stderr)
+        self.assertEqual(save_result.stdout, f"{WS_NUMBER}\n")
+        self.assertEqual(save_result.stderr, "")
+
+        output_path = os.path.join(self.workdir, "preview-ws.html")
+        preview_result = self.run_preview(db_path, WS_NUMBER, output_path)
+        self.assertEqual(preview_result.returncode, 0, msg=preview_result.stderr)
+        self.assertEqual(preview_result.stdout, f"{output_path}\n")
+        self.assertEqual(preview_result.stderr, "")
+
+        with open(output_path, "rb") as f:
+            document = f.read().decode("utf-8")
+
+        # 正文样式：编号/客户（dl dd）与明细说明（tbody 第二列）均以
+        # pre-wrap 展示，首尾空格、连续空格、换行与连续换行（空行）按原样呈现。
+        self.assertIn("dl dd { white-space: pre-wrap; }", document)
+        self.assertIn("tbody td:nth-child(2) { white-space: pre-wrap; }", document)
+
+        # 源文中编号与客户（含多行）原样转义保留在各自 <dd> 内。
+        self.assertIn(f"<dd>{ESCAPED_WS_NUMBER}</dd>", document)
+        self.assertIn(
+            f"<dd>{ESCAPED_WS_CUSTOMER}</dd>", document,
+            msg="多行客户应完整保留在客户信息区域的同一个 <dd> 内",
+        )
+
+        # 多行说明（含连续换行）原样转义保留在同一个 <td> 内，不拆行。
+        self.assertIn(f"<td>{ESCAPED_WS_DESC_MULTILINE}</td>", document)
+        self.assertIn(
+            f"<td>{ESCAPED_WS_DESC_BLANK_LINES}</td>", document,
+            msg="连续换行形成的空行应保留在同一条明细的单元格内",
+        )
+        tbody = document[document.index("<tbody>"):document.index("</tbody>")]
+        self.assertEqual(
+            tbody.count("<tr>"), 2,
+            msg="两条明细仍各是一行表格行，多行说明不得拆出新的表格行",
+        )
+
+        # 金额与顺序：行金额 25.00、3.00，总计 28.00，两条明细按输入顺序。
+        markers = [
+            ESCAPED_WS_DESC_MULTILINE,
+            '<td class="num">25.00</td>',
+            ESCAPED_WS_DESC_BLANK_LINES,
+            '<td class="num">3.00</td>',
+            '<td class="num">28.00</td>',
+        ]
+        positions = [document.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+
+        # 用户输入不产生 script 元素；实体样式文本再转义一层显示原文。
+        self.assertNotIn("<script", document.lower())
+        self.assertIn("&amp;lt;资料&amp;gt;", document)
+        self.assertNotIn("&lt;资料&gt;", document)
+
+        # 解析后的可见文本：编号、客户、说明均逐字符等于原文（含空行）。
+        collector = TextAndTagCollector()
+        collector.feed(document)
+        self.assertNotIn("script", collector.start_tags)
+        visible_text = "".join(collector.chunks)
+        self.assertIn(WS_NUMBER, visible_text)
+        self.assertIn(WS_CUSTOMER, visible_text)
+        self.assertIn(WS_DESC_MULTILINE, visible_text)
+        self.assertIn(WS_DESC_BLANK_LINES, visible_text)
+        self.assertIn("&lt;资料&gt;", visible_text)
 
     # ---- 同一编号多次预览：新路径成功且逐字节一致；拒绝覆盖；未知编号 ----
 
