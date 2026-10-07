@@ -6,6 +6,7 @@
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
   python quote.py list    --db demo.sqlite
   python quote.py export  --db demo.sqlite --number Q-DEMO-001
+  python quote.py report  --db demo.sqlite
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
 """
@@ -467,6 +468,60 @@ def cmd_export(args):
     return 0
 
 
+def cmd_report(args):
+    """按客户原文汇总：每张报价计数一次，金额取已保存合计，不重算明细。"""
+    try:
+        conn = open_readonly_database(args.db)
+        try:
+            # 缺表、缺列或文件不是有效 SQLite 都按无法读取数据库处理；
+            # 只读打开保证旧库（即使缺 note 列）不被补列、不被改动。
+            # 汇总只需要 customer 与 total：note 列存在与否不影响报表。
+            quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+            if not quote_columns:
+                raise sqlite3.Error("缺少 quotes 表")
+            required_columns = {"number", "customer", "total"}
+            if not required_columns <= quote_columns:
+                raise sqlite3.Error(
+                    "quotes 表缺少必要列: "
+                    + ", ".join(sorted(required_columns - quote_columns))
+                )
+
+            # 分组键为客户原文，SQLite 默认 BINARY 比较：大小写、首尾空格、
+            # 连续空格与换行都逐字符参与分组，% 与 _ 只是普通字符。
+            # 每张报价主行只参与一次计数，与明细条数无关；零金额同样计数。
+            # 金额直接累加已保存的 total，不按 items 重算。
+            # 不用 SQL 的 SUM：整数累计超过有符号 64 位上限时它会直接报
+            # integer overflow（而非提升精度），无法满足精确输出要求；
+            # 改为取回每个分单位整数后由 Python 任意精度整数相加。
+            # ORDER BY customer 用 BINARY 排序，相同客户必然相邻，下面按首次
+            # 出现顺序构造分组即可保持 BINARY 升序，与保存先后无关。
+            rows = conn.execute(
+                "SELECT customer, total FROM quotes ORDER BY customer"
+            ).fetchall()
+            groups = {}
+            for customer, line_total in rows:
+                group = groups.get(customer)
+                if group is None:
+                    groups[customer] = {
+                        "customer": customer,
+                        "quote_count": 1,
+                        "total": line_total,
+                    }
+                else:
+                    group["quote_count"] += 1
+                    group["total"] += line_total
+            report = list(groups.values())
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return fail(f"无法读取数据库 {args.db}: {exc}")
+
+    # 客户原文只做 JSON 所需转义；计数与累计均为 Python 整数（任意精度），
+    # 空库时 report 为空列表，输出 []。
+    sys.stdout.write(json.dumps(report, ensure_ascii=False) + "\n")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="报价单保存与 HTML 预览")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -497,6 +552,12 @@ def build_parser():
     export_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
     export_parser.add_argument("--number", required=True, help="报价编号（原文精确匹配）")
     export_parser.set_defaults(handler=cmd_export)
+
+    report_parser = subparsers.add_parser(
+        "report", help="按客户原文汇总报价张数与累计金额（只读，只输出到标准输出）"
+    )
+    report_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    report_parser.set_defaults(handler=cmd_report)
 
     return parser
 
