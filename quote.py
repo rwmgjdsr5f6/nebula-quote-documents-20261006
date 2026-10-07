@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""报价单保存与按编号生成 HTML 预览。
+"""报价单保存、按编号生成 HTML 预览与按编号导出 JSON。
 
 仅使用 Python 3 标准库与本地 SQLite：
   python quote.py save    --db demo.sqlite --input quote.json
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
   python quote.py list    --db demo.sqlite
+  python quote.py export  --db demo.sqlite --number Q-DEMO-001
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
 """
@@ -367,6 +368,80 @@ def cmd_list(args):
     return 0
 
 
+def cmd_export(args):
+    # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
+    db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
+    try:
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            # 缺表或缺列都按无法读取数据库处理；旧库缺 note 列是唯一例外，
+            # 此时按无说明导出，不补列、不改动已有数据。
+            quote_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(quotes)")
+            }
+            required_quote_columns = {"number", "customer"}
+            if not quote_columns:
+                raise sqlite3.Error("缺少 quotes 表")
+            if not required_quote_columns <= quote_columns:
+                raise sqlite3.Error(
+                    "quotes 表缺少必要列: "
+                    + ", ".join(sorted(required_quote_columns - quote_columns))
+                )
+            item_columns = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+            required_item_columns = {
+                "quote_number", "position", "description", "quantity", "unit_price",
+            }
+            if not item_columns:
+                raise sqlite3.Error("缺少 items 表")
+            if not required_item_columns <= item_columns:
+                raise sqlite3.Error(
+                    "items 表缺少必要列: "
+                    + ", ".join(sorted(required_item_columns - item_columns))
+                )
+
+            if "note" in quote_columns:
+                cursor = conn.execute(
+                    "SELECT customer, note FROM quotes WHERE number = ?",
+                    (args.number,),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT customer, NULL FROM quotes WHERE number = ?",
+                    (args.number,),
+                )
+            quote_row = cursor.fetchone()
+            if quote_row is None:
+                return fail(f"报价编号不存在: {args.number}")
+            customer, note = quote_row
+            # 编号按原文精确匹配（SQLite TEXT 默认 BINARY 比较）：
+            # 大小写与空格都参与匹配，不做任何归一化。
+            item_rows = conn.execute(
+                "SELECT description, quantity, unit_price "
+                "FROM items WHERE quote_number = ? ORDER BY position",
+                (args.number,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return fail(f"无法读取数据库 {args.db}: {exc}")
+
+    # 导出结构与 save 接受的输入一致：number、customer、items，
+    # 非空说明才带 note；不输出内部标识、行金额或合计。
+    items = [
+        {"description": description, "quantity": quantity, "unit_price": unit_price}
+        for description, quantity, unit_price in item_rows
+    ]
+    quote = {"number": args.number, "customer": customer, "items": items}
+    if note:
+        # 非空（含纯空白）说明原样输出；NULL 或空字符串省略 note。
+        quote["note"] = note
+
+    # 全部读取成功后才输出整份 JSON：失败路径绝不留下部分 JSON。
+    # ensure_ascii=False 保留原文；json.dumps 只做 JSON 所需转义，不做 HTML 转义。
+    sys.stdout.write(json.dumps(quote, ensure_ascii=False) + "\n")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="报价单保存与 HTML 预览")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -385,6 +460,13 @@ def build_parser():
     list_parser = subparsers.add_parser("list", help="列出已保存报价的编号、客户与合计")
     list_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
     list_parser.set_defaults(handler=cmd_list)
+
+    export_parser = subparsers.add_parser(
+        "export", help="按编号导出单张报价的 save 兼容 JSON（只输出到标准输出）"
+    )
+    export_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    export_parser.add_argument("--number", required=True, help="报价编号（原文精确匹配）")
+    export_parser.set_defaults(handler=cmd_export)
 
     return parser
 
