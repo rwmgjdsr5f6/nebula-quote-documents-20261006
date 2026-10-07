@@ -5,7 +5,7 @@
   python quote.py save    --db demo.sqlite --input quote.json
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
   python quote.py list    --db demo.sqlite [--customer 客户名] [--output list.html]
-  python quote.py export  --db demo.sqlite --number Q-DEMO-001
+  python quote.py export  --db demo.sqlite --number Q-DEMO-001 [--output quote.json]
   python quote.py report  --db demo.sqlite [--customer 客户名] [--output report.html]
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
@@ -493,6 +493,11 @@ def cmd_list(args):
 
 
 def cmd_export(args):
+    # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
+    output = args.output
+    if output is not None and os.path.exists(output):
+        return fail(f"输出文件已存在: {output}")
+
     try:
         conn = open_readonly_database(args.db)
         try:
@@ -545,9 +550,23 @@ def cmd_export(args):
         # 非空（含纯空白）说明原样输出；NULL 或空字符串省略 note。
         quote["note"] = note
 
-    # 全部读取成功后才输出整份 JSON：失败路径绝不留下部分 JSON。
+    # 全部读取成功后才生成整份 JSON：失败路径绝不留下部分 JSON。
     # ensure_ascii=False 保留原文；json.dumps 只做 JSON 所需转义，不做 HTML 转义。
-    sys.stdout.write(json.dumps(quote, ensure_ascii=False) + "\n")
+    document = json.dumps(quote, ensure_ascii=False) + "\n"
+
+    if output is None:
+        # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。
+        sys.stdout.write(document)
+        return 0
+
+    # O_EXCL 兜底：即使并发出现同名文件也不覆盖；UTF-8 编码不带 BOM，
+    # 内容为单行 JSON 加一个 LF。输出目录不存在等写入失败在此报错，
+    # 此前数据库只读访问不会留下任何改动。
+    error = write_new_file(output, document.encode("utf-8"))
+    if error is not None:
+        return fail(f"无法写入输出文件 {output}: {error}")
+
+    print(output)
     return 0
 
 
@@ -727,10 +746,15 @@ def build_parser():
     list_parser.set_defaults(handler=cmd_list)
 
     export_parser = subparsers.add_parser(
-        "export", help="按编号导出单张报价的 save 兼容 JSON（只输出到标准输出）"
+        "export", help="按编号导出单张报价的 save 兼容 JSON"
     )
     export_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
     export_parser.add_argument("--number", required=True, help="报价编号（原文精确匹配）")
+    export_parser.add_argument(
+        "--output",
+        default=None,
+        help="将导出 JSON 保存到该路径（目录需已存在，UTF-8 无 BOM）；省略时输出到标准输出",
+    )
     export_parser.set_defaults(handler=cmd_export)
 
     report_parser = subparsers.add_parser(
