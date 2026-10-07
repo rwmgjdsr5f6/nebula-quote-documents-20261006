@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""报价单保存与按编号生成 HTML 预览。
+"""报价单保存、按编号导出 JSON 与生成 HTML 预览。
 
 仅使用 Python 3 标准库与本地 SQLite：
   python quote.py save    --db demo.sqlite --input quote.json
+  python quote.py export  --db demo.sqlite --number Q-DEMO-001
   python quote.py preview --db demo.sqlite --number Q-DEMO-001 --output preview.html
   python quote.py list    --db demo.sqlite
 
 金额一律以分为单位的整数存储；预览时换算为元并保留两位小数。
+导出的 JSON 与 save 接受的结构一致，整数金额原样输出，不做元换算。
 """
 
 import argparse
@@ -342,6 +344,58 @@ def cmd_preview(args):
     return 0
 
 
+def cmd_export(args):
+    """按编号导出单张报价为 save 可重新保存的 JSON（只读，不生成文件）。"""
+    # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
+    db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
+    try:
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
+            # 旧库可能没有 note 列（只读打开不能补列），此时一律视为无说明。
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+            if "note" in columns:
+                cursor = conn.execute(
+                    "SELECT customer, note FROM quotes WHERE number = ?",
+                    (args.number,),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT customer, NULL FROM quotes WHERE number = ?",
+                    (args.number,),
+                )
+            quote_row = cursor.fetchone()
+            if quote_row is None:
+                return fail(f"报价编号不存在: {args.number}")
+            customer, note = quote_row
+            # 明细按保存时的 position 升序，保留输入顺序；说明相同也是独立行。
+            item_rows = conn.execute(
+                "SELECT description, quantity, unit_price FROM items "
+                "WHERE quote_number = ? ORDER BY position",
+                (args.number,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return fail(f"无法读取数据库 {args.db}: {exc}")
+
+    items = [
+        {"description": description, "quantity": quantity, "unit_price": unit_price}
+        for description, quantity, unit_price in item_rows
+    ]
+    quote = {"number": args.number, "customer": customer, "items": items}
+    # 非空说明（含纯空白）原样输出；NULL 或空字符串省略 note。
+    if note:
+        quote["note"] = note
+
+    # 一行完整 UTF-8 JSON 加末尾换行；ensure_ascii=False 保留原文，
+    # 分隔符去掉多余空白；尖括号等只做 JSON 所需转义，不做 HTML 转义。
+    sys.stdout.write(
+        json.dumps(quote, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    return 0
+
+
 def cmd_list(args):
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
     db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
@@ -368,13 +422,22 @@ def cmd_list(args):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="报价单保存与 HTML 预览")
+    parser = argparse.ArgumentParser(description="报价单保存、JSON 导出与 HTML 预览")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     save_parser = subparsers.add_parser("save", help="保存报价单到 SQLite")
     save_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
     save_parser.add_argument("--input", required=True, help="UTF-8 JSON 报价单路径")
     save_parser.set_defaults(handler=cmd_save)
+
+    export_parser = subparsers.add_parser(
+        "export", help="按编号导出单张报价的 save 兼容 JSON"
+    )
+    export_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
+    export_parser.add_argument(
+        "--number", required=True, help="报价编号（原文精确匹配）"
+    )
+    export_parser.set_defaults(handler=cmd_export)
 
     preview_parser = subparsers.add_parser("preview", help="按编号生成 HTML 预览")
     preview_parser.add_argument("--db", required=True, help="SQLite 数据库路径")
