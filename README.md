@@ -102,6 +102,49 @@ python3 quote.py export --db demo.sqlite --number Q-DEMO-001
 
 导出的 JSON 可直接作为 save 的输入保存到另一份数据库；两次保存之间编号不得重复。
 
+### 独立调用导出文本生成规则
+
+导出文本的生成规则集中在纯函数 `render_quote_json(number, customer, note, items)`，
+`export` 命令在读库后也调用同一函数，因此独立调用与命令行导出的文本必然一致；
+该函数不打开数据库、不创建文件、不读写标准流，也不做校验或重算金额，只负责把
+已读取的合法内容转换为完整 JSON 文本。
+
+- 入参：
+  - `number`：报价编号原文（字符串）；
+  - `customer`：客户名原文（字符串）；
+  - `note`：说明原文；`None`（缺失或 NULL）或空字符串表示无说明，纯空白字符串仍是有效说明；
+  - `items`：按顺序排列的明细序列，每项为 `(description, quantity, unit_price)` 三元组，
+    `quantity` 与 `unit_price` 均为整数（单价为分单位），重复说明作为独立条目各自保留。
+- 返回：一行完整 JSON 字符串，末尾恰好一个换行（LF）；键顺序固定为
+  `number`、`customer`、`items`，有说明时 `note` 位于最后；明细对象只含
+  `description`、`quantity`、`unit_price`，不含内部标识、行金额或合计。
+- 文本规则与命令行导出完全相同：编号、客户、说明和明细文字逐字符保留（首尾空格、
+  连续空格、换行、尖括号、与号和引号），只做 JSON 所需转义（`ensure_ascii=False`）；
+  数量与单价输出为 JSON 整数，大整数不丢精度；`note` 为 `None` 或空字符串时省略该字段，
+  纯空白说明原样保留。
+- 调用方式（项目根目录）：
+
+```python
+from quote import render_quote_json
+
+text = render_quote_json(
+    "Q-DEMO-001",
+    '演示客户\n<甲>&"乙"',
+    " 说明<甲>&乙\n第二行 ",
+    [("服务", 2, 1250), ("服务", 1, 0)],
+)
+```
+
+返回的 `text` 是下面这一行文本再加末尾一个换行（写法中的 `\n`、`\"` 是 JSON
+转义后的两个字符，值内真实换行不会出现在物理行中）：
+
+```
+{"number": "Q-DEMO-001", "customer": "演示客户\n<甲>&\"乙\"", "items": [{"description": "服务", "quantity": 2, "unit_price": 1250}, {"description": "服务", "quantity": 1, "unit_price": 0}], "note": " 说明<甲>&乙\n第二行 "}
+```
+
+需要落盘时以 UTF-8（无 BOM）编码写入即可，得到的字节与 `export --output`
+写入的文件、省略 `--output` 时的标准输出完全一致。
+
 ## 按客户汇总报表
 
 ```

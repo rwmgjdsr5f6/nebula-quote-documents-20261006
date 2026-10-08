@@ -554,6 +554,38 @@ def cmd_list(args):
     return 0
 
 
+def render_quote_json(number, customer, note, items):
+    """把一张已读取的报价及其有序明细渲染为单行导出 JSON 文本（以换行结尾）。
+
+    这是 export 文本生成规则的唯一规则来源，全部基于入参计算，不打开
+    数据库、不创建文件、不写标准输出，可脱离命令行与数据库独立验证；
+    公开 export 入口同样经此函数生成文本，二者始终使用同一套规则：
+      - 结构与 save 接受的输入一致：number、customer、items，非空说明
+        才含 note；不输出内部标识、行金额或合计；
+      - items 为有序的 (description, quantity, unit_price) 序列，逐条
+        转为只含 description、quantity、unit_price 三键的对象，顺序
+        不变，重复说明保持为独立条目；
+      - 数量与单价原样作为 JSON 整数输出（分单位；Python 整数不受
+        有符号 64 位限制），不换算为元、浮点或字符串；
+      - 编号、客户、说明与明细文字逐字符保留，ensure_ascii=False
+        使中文、尖括号、与号原样输出，json.dumps 只做 JSON 所需转义
+        （引号、换行等），不做 HTML 转义；
+      - note 为 None 或空字符串时省略；纯空白说明原样保留；
+      - 只处理已读取的合法内容，不做校验，也不重算行金额或合计。
+    返回 json.dumps(..., ensure_ascii=False) 加恰好一个 LF：一个物理
+    行、无 CR；UTF-8 无 BOM 的编码由调用方落盘或写标准输出时完成。
+    """
+    records = [
+        {"description": description, "quantity": quantity, "unit_price": unit_price}
+        for description, quantity, unit_price in items
+    ]
+    quote = {"number": number, "customer": customer, "items": records}
+    if note:
+        # 非空（含纯空白）说明原样输出；NULL 或空字符串省略 note。
+        quote["note"] = note
+    return json.dumps(quote, ensure_ascii=False) + "\n"
+
+
 def cmd_export(args):
     # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
     output = args.output
@@ -593,7 +625,7 @@ def cmd_export(args):
             if found is None:
                 return fail(f"报价编号不存在: {args.number}")
             customer, note, _ = found
-            item_rows = fetch_items(
+            items = fetch_items(
                 conn, args.number, ("description", "quantity", "unit_price")
             )
         finally:
@@ -601,20 +633,10 @@ def cmd_export(args):
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
-    # 导出结构与 save 接受的输入一致：number、customer、items，
-    # 非空说明才带 note；不输出内部标识、行金额或合计。
-    items = [
-        {"description": description, "quantity": quantity, "unit_price": unit_price}
-        for description, quantity, unit_price in item_rows
-    ]
-    quote = {"number": args.number, "customer": customer, "items": items}
-    if note:
-        # 非空（含纯空白）说明原样输出；NULL 或空字符串省略 note。
-        quote["note"] = note
-
-    # 全部读取成功后才生成整份 JSON：失败路径绝不留下部分 JSON。
-    # ensure_ascii=False 保留原文；json.dumps 只做 JSON 所需转义，不做 HTML 转义。
-    document = json.dumps(quote, ensure_ascii=False) + "\n"
+    # 全部读取成功后才经纯函数生成整份 JSON：不做校验、不重算金额；
+    # 失败路径绝不留下部分 JSON。ensure_ascii=False 保留原文，
+    # json.dumps 只做 JSON 所需转义，不做 HTML 转义。
+    document = render_quote_json(args.number, customer, note, items)
 
     if output is None:
         # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。
