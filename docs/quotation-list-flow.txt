@@ -1,0 +1,533 @@
+报价列表（list）参数、查询、呈现与文件写入流程说明（与当前源码逐项核对）
+========================================================================
+
+核对基准
+--------
+- 产品源码：quote.py（仓库根目录，唯一可执行源码，当前全文 844 行）。
+- 公开文档：README.md“报价列表”一节（README.md:53-80）。
+- 回归测试：tests/ 下与 list 直接相关的三个文件——
+  tests/test_list_flow.py（JSON 形式、排序、字段白名单、旧库、读库失败、只读边界）、
+  tests/test_list_html_flow.py（HTML 形式、空态、转义、筛选、已存 total、旧库、
+  失败路径）、
+  tests/test_customer_filter_flow.py（--customer 精确筛选矩阵、% 与 _、空白拒绝、
+  旧库与只读边界）。
+- 本次核对实际运行 python3 -m unittest discover -s tests：155 个用例全部通过
+  （连跑两次均 OK，耗时约 50 秒/次）。本说明所有行号均以当前 quote.py 为准。
+
+证据分级（严格区分三类结论，不混用）
+  【源码】由当前 quote.py 源码直接推导，标注函数名与行号。
+  【测试】已有回归测试中的断言，标注测试文件与行号；通过情况以上述本次实跑为准。
+  【样例】本文第七节三张合成报价（Q-B/Q-C/Q-A）的输入、命令与确定预期。
+          该样例已在本次核对时于仓库外临时目录（/tmp/quote-list-doc-JlQUbl，
+          Linux + Python 3 标准库 sqlite3）按文档命令实际执行，凡引用其
+          实际输出处标【实测】；未实际执行的内容一律不写成实测。
+  本次交付只新增本文档，不修改 quote.py、README.md、测试与任何数据格式；
+  save / preview / list / export / report 的既有命令与行为均保持不变。
+
+
+一、公开入口与“参数进入 -> 查询 -> 呈现 -> 文件写入”的路径
+-----------------------------------------------------------
+
+公开命令（README.md:55-58）：
+
+  python3 quote.py list --db demo.sqlite
+  python3 quote.py list --db demo.sqlite --customer 演示客户 --output list.html
+
+省略 --output 时输出一行 JSON 到标准输出；带 --output 时生成离线 HTML，
+标准输出仅回显输出路径。
+
+入口与处理位置【源码】：
+
+  list 子命令参数定义        build_parser()   quote.py:792-804
+    --db（必填，793 行）、--customer（默认 None，794-798 行）、
+    --output（默认 None，799-803 行）
+  分发到处理函数              main()           quote.py:837-840
+  list 处理函数              cmd_list()       quote.py:436-492
+  列表 HTML 渲染             render_list_html()      quote.py:385-433
+  独占新建输出文件            write_new_file()        quote.py:320-349
+  分->元格式                  format_yuan()           quote.py:251-253
+  统一失败出口                fail()                  quote.py:51-54
+
+cmd_list() 内部的固定顺序（quote.py:436-492）【源码】：
+
+  1. 空白客户筛选值拒绝        quote.py:439-441（在读库与建文件之前）
+  2. --output 目标已存在拒绝   quote.py:444-446（同样在读库之前）
+  3. 以只读 URI 打开数据库     quote.py:449-451（内联拼
+                               file:<绝对路径>?mode=ro，与
+                               open_readonly_database() quote.py:212-217
+                               的写法等价；数据库不存在也不创建任何文件）
+  4. 查询 quotes 主表          无筛选 SELECT  quote.py:459-461
+                               带筛选 SELECT  quote.py:463-467（见第三节）
+                               两种形式都 ORDER BY number
+  5. 收口读库错误              quote.py:470-471（见第十节）
+  6a. 无 --output：组装记录并输出单行 JSON
+                               quote.py:473-481（见第四节）
+  6b. 有 --output：render_list_html 渲染（483 行调用），
+      write_new_file 以 O_EXCL 落盘（quote.py:487-489），
+      成功后 print 路径（quote.py:491）（见第五、十节）
+
+整条路径只读 quotes 主表：SQL 中没有 JOIN items，没有任何 CREATE/ALTER，
+失败路径也不会留下数据库或 HTML 文件（只读 URI + O_EXCL 新建）。
+
+
+二、为什么列表使用库中已保存的 total，而不读取明细重新计算
+----------------------------------------------------------
+
+结论：list 显示的合计直接来自 quotes.total——save 时计算一次、随主表行落库的
+报价合计；list 不读取 items 表、不做 quantity*unit_price 或 SUM 重算。
+
+【源码】
+- 查询只取主表三列：SELECT number, customer, total FROM quotes
+  （无筛选 quote.py:460；带筛选 quote.py:464-466），FROM 子句只有 quotes，
+  全程不碰 items 表（连保存时已算好的 items.line_amount 也不读）。
+- HTML 渲染时合计直接进入金额换算：render_list_html 对每行调用
+  format_yuan(total)（quote.py:400）；JSON 则把 total 原样放入记录
+  （quote.py:476-479）。两条输出路径都没有乘法或求和。
+- format_yuan(cents) = f"{cents // 100}.{cents % 100:02d}"
+  （quote.py:251-253）：纯整数 //100 与 %100 两位补零，无浮点、无舍入；
+  零金额得 0.00，极大整数也不丢精度。render_list_html 的文档字符串明确
+  “合计直接读取库中保存值……不重新计算明细、不使用浮点”
+  （quote.py:386-393）。
+
+total 的来路（供溯源）【源码】：
+- save 校验时每条明细算行金额 line_amount = quantity * unit_price
+  （validate_quote quote.py:129），total = 各行之和（quote.py:135），
+  并在求和后做有符号 64 位上限检查（quote.py:136-137；单行范围检查
+  quote.py:126-131）。
+- total 随主表行一次 INSERT 落库（cmd_save quote.py:187-190）。
+  list 是这一已存值的纯读取方。
+
+刻意不重算的四点理由（均可由源码与测试核对）：
+1. 单一事实来源、各命令口径一致：报价合计只在 save 时计算一次。preview 同样
+   读取已存 total（find_quote(..., ("total",))，cmd_preview quote.py:357-364，
+   注释“预览需要已存的合计与行金额：直接读取，不重新计算”quote.py:357），
+   report 也只 SELECT customer, total（read_report_rows quote.py:642-660）。
+   若列表改读明细重算，库中 total 与 items 不一致（手工改库、部分迁移等）时，
+   列表会与预览、报表显示两个数。
+2. 以已存值为准是显式承诺：测试直接把 Q-B 的 total 篡改为 9999，列表 HTML
+   即显示 99.99，而不是按明细重算的 28.00
+   （tests/test_list_html_flow.py:205-221）。
+3. 旧库可以没有 items 表：list 必须能在只有 quotes 三列的旧库上工作
+   （见第九节；tests/test_list_html_flow.py:60-66 的旧库结构就没有 items 表，
+   用例 418-453 正常渲染）。重算明细会直接破坏这一兼容性。
+4. 简单且无精度问题：每张报价在主表恰有一行，列表无需 JOIN 或聚合；
+   已存 total 是 save 时校验过范围的整数，format_yuan 整数换算即可。
+
+
+三、--customer 是 SQL = 精确匹配：空格、大小写、换行参与，% 与 _ 不通配
+------------------------------------------------------------------------
+
+【源码】带筛选时查询为参数化等值比较（quote.py:463-467）：
+
+    SELECT number, customer, total FROM quotes
+    WHERE customer = ? ORDER BY number          -- 参数为 args.customer
+
+- 比较运算是 "="，不是 LIKE：参数绑定，% 与 _ 只是普通字符，不存在通配展开
+  或转义问题（注释 quote.py:456-457）。
+- SQLite TEXT 默认 BINARY 排序规则：按 UTF-8 字节逐字符比较，大小写、首尾
+  空格、连续空格与换行都参与，不做大小写折叠、trim 或任何归一化
+  （注释 quote.py:454-457）。
+- 筛选值本身不做裁剪：空白检查用的是 customer.strip() 的返回值是否为空
+  （quote.py:440），通过检查后参与查询的仍是原字符串 customer
+  （quote.py:439、466），所以“ 演示”（前导空格）这类合法值会带着空格
+  原样进入 WHERE。
+- 合法但无匹配是成功查询：只是取回 0 行，退出码 0（见第八节）。
+
+【测试】
+- 大小写/空格矩阵：Demo、demo、" Demo "、DEMO 四个筛选值各只命中逐字符
+  相同者，DEMO 无命中得 []（tests/test_customer_filter_flow.py:211-249）。
+- 换行参与：把换行换成空格、半角符号换成全角等近似变体全部落空
+  （tests/test_customer_filter_flow.py:323-334）；含首尾空格与换行的客户
+  必须用同一原文才命中（tests/test_list_html_flow.py:227-263）。
+- % 与 _ 为普通字符：客户 "Demo%" 只命中自身，不顺带命中 Demo100；
+  "Demo_" 只命中自身，不顺带命中 DemoX
+  （tests/test_customer_filter_flow.py:336-359）；"100%_特价" 只有用
+  该原文才命中，"100_特价" 落空（tests/test_list_html_flow.py:304-329）。
+- 任何相似但不逐字符相等的客户名都不串号
+  （tests/test_customer_filter_flow.py:293-334）。
+
+【实测】本文样例中 Q-C 的客户比 Q-A/Q-B 在名称前多一个空格：
+用 "演示<甲>&乙"（无前导空格）筛选只返回 Q-A、Q-B（见 7.2）；
+用 " 演示<甲>&乙"（一个前导空格）筛选只返回 Q-C：
+
+  [{"number": "Q-C", "customer": " 演示<甲>&乙", "total": 100}]
+
+大小写与换行的同类结论上述【测试】已覆盖，本次未在临时库另造样例，
+故不标实测。
+
+
+四、JSON 形式（省略 --output）：单行、三字段、分单位整数
+---------------------------------------------------------
+
+【源码 quote.py:473-481】
+- 记录由查询行直接列表推导，字段固定且仅三个：
+  {"number": ..., "customer": ..., "total": ...}（quote.py:476-479）。
+  客户说明 note 不在 SELECT 列中（quote.py:460、464-466），输出对象里
+  无从出现；items、line_amount 等内部数据同样不出现。
+- total 是 JSON 整数（分单位），不换算为元、不转字符串或浮点。
+- sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+  （quote.py:480）：恰好一行 JSON 加一个 LF，无 BOM、无 CRLF；
+  ensure_ascii=False 保留客户原文，尖括号、与号、百分号、下划线裸出现，
+  json.dumps 只做 JSON 所需转义（如引号 \"、换行 \n），不做 HTML 转义。
+- 不创建任何文件（注释 quote.py:474）。
+
+【测试】字段白名单、int 且非 bool、单行单换行、无 \r、原文往返：
+tests/test_list_flow.py:197-239；无筛选全量字段断言
+tests/test_list_html_flow.py:557-578；note 已在库中但不输出的前置自检
+tests/test_list_flow.py:180-191（先查库确认 Q-LIST-A 带 note，再断言
+list 结果只有三个键）。
+
+
+五、HTML 形式（--output）：渲染内容、转义与文件写入
+----------------------------------------------------
+
+渲染【源码：render_list_html() quote.py:385-433】
+- 每行三格：转义后的编号、转义后的客户、format_yuan(total)
+  （quote.py:396-403）；每张报价一行。
+- e = html.escape（quote.py:394）：< 变 &lt;、> 变 &gt;、& 变 &amp;、
+  引号变 &quot;；浏览器显示原文，文本中的标签不会成为真正的元素
+  （quote.py:388-390 注释）。
+- 编号与客户单元格为 white-space: pre-wrap（quote.py:420）：首尾空格、
+  连续空格与换行可见；多行文本仍在同一行内，不拆出新表格行。
+- 页面 <title> 与 <h1> 均为“报价列表”（quote.py:414、425），表头三列
+  “报价编号 / 客户 / 合计（元）”（quote.py:428）；无外部资源引用，
+  可离线打开。
+- 模板中没有客户说明区域：note 从不参与列表 HTML（与第四节 JSON 一致）。
+- 无报价行时保留表头，tbody 为空，另输出
+  <p class="empty">没有匹配的报价</p>（quote.py:406-408；见第八节）。
+
+写入【源码：cmd_list quote.py:483-491 + write_new_file quote.py:320-349】
+- 文档以 UTF-8 编码落盘（document.encode("utf-8")，quote.py:487），无 BOM。
+- write_new_file 以 os.open(path, O_WRONLY|O_CREAT|O_EXCL, 0o644) 新建
+  （quote.py:328）：目标已存在即失败，绝不覆盖；循环 os.write 写完整份
+  字节（quote.py:334-340）。这是 cmd_list 前置 os.path.exists 检查
+  （quote.py:445）之外的并发兜底。
+- 成功后标准输出仅 print(output)——传入路径加一个换行（quote.py:491），
+  标准错误为空。
+
+
+六、排序：ORDER BY number（BINARY），与保存先后无关
+----------------------------------------------------
+
+【源码】两条 SELECT 都以 ORDER BY number 收尾（quote.py:460、465）。
+SQLite TEXT 默认 BINARY 排序，即按编号原文的 UTF-8 字节升序：数字/符号、
+大写、小写、中文各按其字节序排列，与保存顺序无关（注释 quote.py:454-455）。
+【测试】保存顺序刻意为 B、A、a，列表固定为 Q-LIST-A、Q-LIST-B、Q-LIST-a
+（tests/test_list_flow.py:174-212）；HTML 侧 Q-A 在 Q-B 之前
+（tests/test_list_html_flow.py:160-165）。
+【样例】第七节保存顺序为 Q-B、Q-C、Q-A，筛选结果按编号为 Q-A、Q-B。
+
+
+七、三张合成报价贯穿样例（Q-B / Q-C / Q-A）
+--------------------------------------------
+
+样例设计（均为 save 规则下的合法输入，金额单位为分）：
+  Q-B  客户“演示<甲>&乙”，带客户说明，两条明细：
+       数量 2 单价 1250、数量 1 单价 300
+       -> 保存合计 2×1250 + 1×300 = 2800 分（validate_quote
+       quote.py:129、135）。
+  Q-C  客户在该名称前多一个空格，即“ 演示<甲>&乙”，一条明细：
+       数量 1 单价 100 -> 合计 100 分。
+  Q-A  与 Q-B 同一客户“演示<甲>&乙”（无说明），一条明细：
+       数量 1 单价 0 -> 合计 0 分；零单价合法（quote.py:120-124）。
+
+7.1 可供现有 save 直接使用的三份完整 JSON（UTF-8 文件内容）
+
+q-b.json：
+
+{
+  "number": "Q-B",
+  "customer": "演示<甲>&乙",
+  "note": "客户说明：按演示口径保留",
+  "items": [
+    {"description": "咨询", "quantity": 2, "unit_price": 1250},
+    {"description": "资料", "quantity": 1, "unit_price": 300}
+  ]
+}
+
+q-c.json：
+
+{
+  "number": "Q-C",
+  "customer": " 演示<甲>&乙",
+  "items": [
+    {"description": "服务", "quantity": 1, "unit_price": 100}
+  ]
+}
+
+q-a.json：
+
+{
+  "number": "Q-A",
+  "customer": "演示<甲>&乙",
+  "items": [
+    {"description": "赠品", "quantity": 1, "unit_price": 0}
+  ]
+}
+
+按 Q-B、Q-C、Q-A 的顺序准备 demo.sqlite（在仓库根目录；路径可任指空目录）：
+
+  python3 quote.py save --db demo.sqlite --input q-b.json
+  python3 quote.py save --db demo.sqlite --input q-c.json
+  python3 quote.py save --db demo.sqlite --input q-a.json
+
+【实测】三次保存退出码均为 0，标准错误为空，标准输出依次为
+Q-B、Q-C、Q-A（各带换行）。保存后库中主表行为（直接查库核对）：
+
+  ('Q-A', '演示<甲>&乙', 0, None)
+  ('Q-B', '演示<甲>&乙', 2800, '客户说明：按演示口径保留')
+  ('Q-C', ' 演示<甲>&乙', 100, None)
+
+7.2 精确筛选的 JSON 调用（文档要求的第一条命令）
+
+  python3 quote.py list --db demo.sqlite --customer "演示<甲>&乙"
+
+（命令行用双引号包住含 < 与 & 的客户原文；筛选值不经任何归一化。）
+【实测】退出码 0、标准错误为空；标准输出为单行 JSON 数组加一个换行
+（整行连换行共 128 字节），完整预期如下：
+
+[{"number": "Q-A", "customer": "演示<甲>&乙", "total": 0}, {"number": "Q-B", "customer": "演示<甲>&乙", "total": 2800}]
+
+（行末另有一个 "\n"。）读法对照：
+  - 只含 Q-A、Q-B 两张：客户逐字符等于“演示<甲>&乙”；Q-C 的客户前导多
+    一个空格，不命中（第三节），故不出现。
+  - 顺序按编号 BINARY 升序：Q-A 在 Q-B 之前，与保存先后无关（第六节）。
+  - total 为分单位整数 0、2800，读取的是已存 quotes.total（第二节），
+    不是按明细重算（Q-B 两条明细只贡献主表一行，不拆成两条）。
+  - 每个对象只有 number、customer、total 三个键；Q-B 在库中确有说明
+    “客户说明：按演示口径保留”（见 7.1 后查库结果），输出中不出现 note，
+    尖括号与与号保持原文、不做 HTML 转义（第四节）。
+
+7.3 追加 --output 的 HTML 调用（文档要求的第二条命令）
+
+  python3 quote.py list --db demo.sqlite --customer "演示<甲>&乙" --output list.html
+
+【实测】退出码 0、标准错误为空；标准输出仅为目标路径加一个换行：
+
+list.html
+
+生成的 list.html（UTF-8，791 字节，以下为逐字节完整内容）：
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>报价列表</title>
+<style>
+  body { font-family: sans-serif; margin: 2em; }
+  table { border-collapse: collapse; margin-top: 1em; }
+  th, td { border: 1px solid #999; padding: 0.4em 0.8em; }
+  .num { text-align: right; white-space: nowrap; }
+  tbody td:nth-child(1), tbody td:nth-child(2) { white-space: pre-wrap; }
+  .empty { margin-top: 1em; }
+</style>
+</head>
+<body>
+<h1>报价列表</h1>
+<table>
+  <thead>
+    <tr><th>报价编号</th><th>客户</th><th>合计（元）</th></tr>
+  </thead>
+  <tbody>
+      <tr><td>Q-A</td><td>演示&lt;甲&gt;&amp;乙</td><td class="num">0.00</td></tr>
+      <tr><td>Q-B</td><td>演示&lt;甲&gt;&amp;乙</td><td class="num">28.00</td></tr>
+  </tbody>
+</table>
+</body>
+</html>
+
+对照要点：
+  - 与 7.2 是相同的两张报价、相同顺序（Q-A、Q-B）；有报价行时不出现
+    “没有匹配的报价”提示（空态提示仅在无行时渲染，quote.py:395-408）。
+  - 金额 0 分 -> 0.00、2800 分 -> 28.00（format_yuan 整数两位小数，
+    quote.py:251-253、400），读取的仍是已存 total（第二节）。
+  - 客户文本正确转义：单元格内为 演示&lt;甲&gt;&amp;乙（<、>、& 分别
+    转为 &lt;、&gt;、&amp;），浏览器中仍显示“演示<甲>&乙”，不产生标签
+    （quote.py:394-403）；全文不含客户说明内容。
+  - 再次执行同一命令会被“输出文件已存在”拒绝（见第十节）。
+
+7.4 前导空格客户的旁证
+
+【实测】python3 quote.py list --db demo.sqlite --customer " 演示<甲>&乙"
+（筛选值前带一个空格）只返回 Q-C：
+
+[{"number": "Q-C", "customer": " 演示<甲>&乙", "total": 100}]
+
+即多一个空格就是另一个客户，Q-A/Q-B 不命中；JSON 中该前导空格随原文保留。
+
+
+八、空库或无匹配时的输出（成功查询，退出码 0）
+-----------------------------------------------
+
+JSON 形式【源码】：fetchall 得到空列表 -> records 为 [] ->
+json.dumps([]) + "\n" = "[]\n"（quote.py:476-480）。
+【实测】对建全表但无报价的 empty.sqlite、以及 --customer 传不存在的客户，
+标准输出均恰为 [] 加一个换行（3 字节），退出码 0、标准错误为空。
+【测试】tests/test_list_flow.py:262-278（空库）、
+tests/test_customer_filter_flow.py:251-255（无匹配不是错误）。
+
+HTML 形式【源码】：rows 为空时 tbody 渲染为空块
+（quote.py:407），empty_notice = '  <p class="empty">没有匹配的报价</p>\n'
+（quote.py:408），表头 thead 是固定模板（quote.py:427-429），照常输出。
+【实测】空库与无匹配生成的 HTML 中均保留
+  <tr><th>报价编号</th><th>客户</th><th>合计（元）</th></tr>
+tbody 内无任何报价行，并在 </table> 之后、</body> 之前出现
+  <p class="empty">没有匹配的报价</p>
+标准输出仍仅为输出路径加换行。
+【测试】tests/test_list_html_flow.py:335-361（空库与无匹配两种情形）。
+
+
+九、旧库兼容：缺 note 列或 items 表仍可查询，不补结构
+------------------------------------------------------
+
+【源码】list 的 SELECT 只引用 number、customer、total 三列
+（quote.py:460、464-466）：note 列与 items 表从不参与。数据库以只读
+URI 打开（quote.py:449-451），整条路径没有 ALTER、CREATE 或任何写操作，
+因此不补列、不建表、不改记录。
+（对比：save 侧才会为旧库补 note 列，ensure_schema quote.py:148-154；
+那是保存命令的既有行为，与 list 无关，本次均未改动。）
+
+【测试】
+- 旧库（quotes 只有 number/customer/total）正常列出，查询前后 PRAGMA
+  列集合与 sqlite_master 逐字节一致、记录不变
+  （tests/test_list_flow.py:305-358）。
+- 连 items 表都没有的三列旧库同样能生成 HTML，查询后列仍为
+  number/customer/total、表仍只有 quotes
+  （tests/test_list_html_flow.py:415-453）。
+- 旧库上精确筛选规则不变，查询前后表结构、报价与明细均不变
+  （tests/test_customer_filter_flow.py:468-559）。
+
+【实测】手工构造只有 quotes(number,customer,total) 三列、含一条
+客户为 "100%_特价" 的记录的 legacy.sqlite：
+  --customer "100%_特价" ->
+    [{"number": "Q-OLD", "customer": "100%_特价", "total": 100}]
+  --customer "100_特价" -> []      （% 与 _ 是普通字符，见第三节）
+查询后 PRAGMA 列仍为 ['number', 'customer', 'total']，表仍只有 ['quotes']，
+未补 note 列、未建 items 表。
+
+
+十、错误检查顺序与失败路径（退出码、标准流、副作用）
+-----------------------------------------------------
+
+统一出口 fail(message)：向标准错误打印“错误: <原因>”加一个换行，返回 1
+（quote.py:51-54）。下列失败的标准输出均为空。argparse 参数层错误
+（如缺 --db）为退出码 2，不在此列。
+
+检查严格按以下顺序进行，先命中者先拒绝（quote.py:439-489）：
+
+1) 空白客户筛选值（最先，quote.py:439-441）
+   --customer 为 "" 或纯空白（" ".strip() 为空，含空格/制表/换行组合）时，
+   在读库与检查输出文件之前直接 fail("客户筛选值不能为空白")：
+   退出 1、标准输出为空；不创建数据库或 HTML，已存在数据库也不被触碰。
+   【实测】--customer "   " 且 --output 指向已存在文件时，仍只报
+   “错误: 客户筛选值不能为空白”（证明空白检查先于输出文件检查）；
+   --customer $'\t\n' 同样被拒。
+   【测试】对 ""、" "、"\t"、"\n"、" \t \n " 逐个断言，并确认不创建
+   输出、不创建/触碰数据库（tests/test_customer_filter_flow.py:384-422；
+   tests/test_list_html_flow.py:476-493）。
+
+2) 输出文件已存在（其次，quote.py:444-446）
+   合法筛选值下，os.path.exists(output) 命中即在读库之前
+   fail(f"输出文件已存在: {output}")：退出 1、标准输出为空，
+   原文件内容逐字节不变；写入另有 O_EXCL 兜底（write_new_file
+   quote.py:320-349，调用点 quote.py:487），并发出现同名文件也不覆盖。
+   【实测】exists.html 内容为 MARKER，list --output exists.html ->
+   rc=1、stdout 空、stderr“错误: 输出文件已存在: exists.html”，
+   执行后文件内容仍为 MARKER。
+   【测试】tests/test_list_html_flow.py:177-191（重复执行拒绝且内容不变）、
+   459-474。
+
+3) 数据库不存在 / 不可读 / 不是有效 SQLite / 缺必要表列（quote.py:449-471）
+   只读 URI 打开后的 PRAGMA/SELECT 抛 sqlite3.Error 时，统一收口为
+   fail(f"无法读取数据库 {args.db}: {exc}")：退出 1、标准输出为空；
+   标准错误单行、含传入路径与具体原因，不输出异常堆栈。
+   因 mode=ro 且路径不存在不建文件，失败不创建数据库，也不创建 HTML。
+   list 不显式做 PRAGMA 列检查，缺表/缺列由 SELECT 直接报错：
+   缺 quotes 表 -> “no such table: quotes”；缺 total 等列 ->
+   “no such column: total”。
+   【实测】（同一临时库逐一实跑，stdout 均为 0 字节）
+     不存在 nope.sqlite -> “错误: 无法读取数据库 nope.sqlite:
+       unable to open database file”，nope.sqlite 与目标 out.html
+       均未出现；
+     非 SQLite 文件 bad.bin -> “错误: 无法读取数据库 bad.bin:
+       file is not a database”；
+     只有 unrelated 表 -> “错误: 无法读取数据库 notable.sqlite:
+       no such table: quotes”；
+     quotes 缺 total 列 -> “错误: 无法读取数据库 nocol.sqlite:
+       no such column: total”。
+   【测试】不存在、非 SQLite 且字节保留、缺表、分别缺必要列：
+   tests/test_list_flow.py:364-418（错误格式助手 143-168）、
+   tests/test_list_html_flow.py:495-542、
+   tests/test_customer_filter_flow.py:428-465（合法筛选 + 库不可读，
+   且无任何侧车文件残留）。
+   例外（不算缺列）：旧库缺 note 列正常查询（见第九节）——list 根本
+   不读 note。
+
+4) 输出目录不存在 / 写入失败（最后，quote.py:487-489）
+   读库与渲染都成功后，落盘由 write_new_file 完成；打开或写入抛 OSError
+   时 fail(f"无法写入输出文件 {output}: {exc}")：退出 1、标准输出为空，
+   标准错误含路径与原因。此前只有只读数据库访问，不留下数据库改动；
+   写入失败时目标路径可能保留此前已写出的部分字节（write_new_file
+   文档字符串 quote.py:321-326），但绝不覆盖任何已存在文件
+   （前有 exists 检查、底有 O_EXCL）。
+   【实测】--output nodir/list.html（nodir 不存在）-> rc=1、stdout 空、
+   stderr“错误: 无法写入输出文件 nodir/list.html: [Errno 2]
+   No such file or directory: 'nodir/list.html'”。
+   【测试】tests/test_list_html_flow.py:544-551。
+
+失败检查先后顺序一句话：空白客户（439-441）-> 输出已存在（444-446）
+-> 打开/读取数据库（449-471）-> 渲染（483）-> 落盘（487-489）。
+
+
+十一、成功路径的退出码与标准流约定
+-----------------------------------
+
+- JSON 模式：退出码 0；标准错误为空；标准输出为一行 JSON 加恰好一个 LF，
+  无 BOM、无 CRLF（quote.py:480）；空结果为 "[]\n"；不生成任何文件。
+- HTML 模式：退出码 0；标准错误为空；标准输出仅为传入的 --output 路径
+  加一个换行（quote.py:491），不在标准输出回显页面内容；页面以 UTF-8
+  无 BOM 写入新文件。
+- 合法但无匹配属于成功查询：退出码 0，不是错误（见第八节）。
+- list 全程只读数据库：正常查询、空结果与各种拒绝后，表结构与记录
+  保持原样【测试】tests/test_list_flow.py:420-458、
+  tests/test_customer_filter_flow.py:562-597（且无 -wal/-shm/journal
+  残留）。
+
+
+十二、README 与源码的对应
+--------------------------
+
+README.md:53-80 的“报价列表”与当前源码主线一致，逐条落点：
+
+- 两种输出形式（JSON 到 stdout；--output 生成 HTML 且 stdout 仅路径）
+  README.md:60-63 —— quote.py:473-481、483-491。
+- JSON 仅 number/customer/total、分单位整数、单行加换行、不出 note
+  README.md:60-61 —— quote.py:460、464-466、476-480。
+- 标题“报价列表”、三列、按编号 BINARY 升序、与保存顺序无关
+  README.md:64-65 —— quote.py:414、425、428、460、465。
+- 合计取已存 total 不重算明细、整数两位小数、零额 0.00、大整数不丢精度
+  README.md:66-67 —— quote.py:129、135、187-190、251-253、386-400。
+- HTML 转义与 pre-wrap（尖括号/与号/引号显示原文、空格换行可见、不拆行）
+  README.md:68-69 —— quote.py:394-403、420。
+- --customer 逐字符精确匹配；% 与 _ 普通字符；不做子串或归一化
+  README.md:70-71 —— quote.py:439-441、456-457、463-467。
+- 空库/无匹配保留表头与“没有匹配的报价”；旧库缺 note/items 直接查询、
+  不补结构不改记录 README.md:72-73 —— quote.py:406-408、449-466。
+- 空白客户先拒绝、输出已存在拒绝且不覆盖、写失败报错
+  README.md:74-77 —— quote.py:439-446、320-349、487-489。
+- 数据库不存在/不可读/非 SQLite/缺表缺列报错且不创建数据库或 HTML
+  README.md:78-80 —— quote.py:449-471、212-217。
+
+
+十三、本次交付边界
+------------------
+
+- 仅新增本文件 docs/quotation-list-flow.txt（UTF-8 纯文本）；quote.py、
+  README.md、tests/ 与任何数据格式均未修改（交付前后 git 工作区对产品
+  代码无差异；本文全部样例数据都在仓库外 /tmp 临时目录中）。
+- 未新增任何功能：save、preview、list、export、report 的命令行、
+  JSON/HTML 格式与保存、预览、列表、导出、汇总的既有行为全部保持原样。
+- 验收可按第七节三份 JSON 输入、三条 save 命令（Q-B、Q-C、Q-A 顺序）
+  与两条 list 命令（精确筛选 JSON、追加 --output list.html）逐项复现，
+  并对照本文给出的完整预期输出与第一至六、十节标注的 quote.py
+  函数/行号、各 tests 断言位置核对。
