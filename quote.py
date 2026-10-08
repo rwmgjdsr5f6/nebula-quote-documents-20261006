@@ -433,12 +433,95 @@ def render_list_html(rows):
 """
 
 
+def validate_list_customer_filter(customer_filter):
+    """校验列表客户筛选值。
+
+    返回原值（含两端空白，供逐字符精确匹配）；None 表示不筛选；
+    空字符串或纯空白抛出 ValueError。纯字符串运算，不访问数据库、
+    不创建任何文件。
+    """
+    if customer_filter is not None and not customer_filter.strip():
+        raise ValueError("客户筛选值不能为空白")
+    return customer_filter
+
+
+def arrange_quote_summaries(rows, customer_filter=None):
+    """对读取出的 (number, customer, total) 摘要行执行精确筛选与排序。
+
+    这是列表筛选与排序口径的唯一规则来源，公开 list 入口与脱离命令行、
+    数据库的独立验证都调用本函数。全部基于入参序列计算，不打开数据库、
+    不创建输出文件、不写标准输出：
+      - 筛选：提供 customer_filter 时只保留客户原文与之逐字符相同的行，
+        大小写、首尾空格、连续空格与换行都参与比较，% 与 _ 按普通字符
+        处理，不做子串搜索、LIKE 通配或任何归一化；
+      - 排序：按编号原文的 UTF-8 字节升序，等价于 SQLite TEXT 的
+        BINARY 排序，与输入（保存）顺序无关；
+      - 合计：原样沿用入参 total（保存时已落库的值），不重算明细。
+    返回 [(number, customer, total), ...]。
+    """
+    if customer_filter is None:
+        selected = list(rows)
+    else:
+        selected = [
+            (number, customer, total)
+            for number, customer, total in rows
+            if customer == customer_filter
+        ]
+    selected.sort(key=lambda row: row[0].encode("utf-8"))
+    return selected
+
+
+def render_list_json(records):
+    """渲染 list 的单行 JSON 文本（以换行结尾），不落盘。
+
+    每条仅 number、customer、total 三个字段，total 为分单位 JSON 整数，
+    不换算为元、浮点或字符串；ensure_ascii=False 保留编号与客户原文，
+    json.dumps 只做 JSON 所需转义（引号、换行等），不做 HTML 转义。
+    空结果为 "[]\n"。
+    """
+    payload = [
+        {"number": number, "customer": customer, "total": total}
+        for number, customer, total in records
+    ]
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def read_list_rows(conn):
+    """只读校验 quotes 表必要列并读取列表所需的 (number, customer, total) 行。
+
+    列表只需要 quotes 主表的 number、customer、total 三列；旧库缺 note
+    列或 items 表都不影响，不补列、不改动已有数据。缺 quotes 表或必要
+    列、文件不是有效 SQLite 等都抛出 sqlite3.Error。合计直接读取保存的
+    total，不 JOIN items、不重新计算明细。
+
+    这里刻意不在 SQL 中做筛选与排序：那部分规则统一由
+    arrange_quote_summaries 承担，使公开 list 入口与独立验证使用同一套
+    纯函数规则。
+    """
+    quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+    required_columns = {"number", "customer", "total"}
+    if not quote_columns:
+        raise sqlite3.Error("缺少 quotes 表")
+    if not required_columns <= quote_columns:
+        raise sqlite3.Error(
+            "quotes 表缺少必要列: "
+            + ", ".join(sorted(required_columns - quote_columns))
+        )
+    return conn.execute("SELECT number, customer, total FROM quotes").fetchall()
+
+
 def cmd_list(args):
+    # 本函数只做流程编排与失败收口；客户筛选值校验、筛选与排序规则在
+    # validate_list_customer_filter / arrange_quote_summaries 纯函数中，
+    # 数据库访问在 read_list_rows 中，输出渲染在 render_list_json /
+    # render_list_html 中。
+
     # 客户筛选值在访问数据库与创建输出文件前校验：空字符串或纯空白直接拒绝；
     # 含有效文字时保留两端空白，原样参与精确匹配。
-    customer = args.customer
-    if customer is not None and not customer.strip():
-        return fail("客户筛选值不能为空白")
+    try:
+        customer_filter = validate_list_customer_filter(args.customer)
+    except ValueError as exc:
+        return fail(str(exc))
 
     # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
     output = args.output
@@ -446,44 +529,31 @@ def cmd_list(args):
         return fail(f"输出文件已存在: {output}")
 
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
-    db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
+    # 缺表、缺列或文件不是有效 SQLite 都在 read_list_rows 中抛出 sqlite3.Error；
+    # 旧库缺 note 列或缺 items 表都不影响读取，不补结构、不改动已有记录。
     try:
-        conn = sqlite3.connect(db_uri, uri=True)
+        conn = open_readonly_database(args.db)
         try:
-            # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
-            # number 使用默认 BINARY 排序，与保存先后无关；旧库缺 note 列或
-            # 缺 items 表都不影响本查询，不补结构、不改动已有记录。
-            # 客户筛选用 = 精确比较（BINARY 排序规则）：大小写、空格、换行都参与
-            # 匹配，% 与 _ 等符号按普通字符处理，不做子串搜索或归一化。
-            if customer is None:
-                rows = conn.execute(
-                    "SELECT number, customer, total FROM quotes ORDER BY number"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT number, customer, total FROM quotes "
-                    "WHERE customer = ? ORDER BY number",
-                    (customer,),
-                ).fetchall()
+            rows = read_list_rows(conn)
         finally:
             conn.close()
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
+    # 读库之后的精确筛选与 BINARY 排序都在纯函数中：不触碰数据库或文件，
+    # 与独立验证调用的是同一个函数；合计沿用已保存的 total，不重算明细。
+    records = arrange_quote_summaries(rows, customer_filter)
+
     if output is None:
         # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。
-        # 原文输出编号与客户，不做转义或裁剪；total 为分单位整数，不换算。
-        records = [
-            {"number": number, "customer": customer, "total": total}
-            for number, customer, total in rows
-        ]
-        sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+        sys.stdout.write(render_list_json(records))
         return 0
 
-    document = render_list_html(rows)
+    document = render_list_html(records)
 
     # O_EXCL 兜底：即使并发出现同名文件也不覆盖；输出目录不存在等写入
-    # 失败在此报错，此前数据库只读访问不会留下任何改动。
+    # 失败在此报错，此前数据库只读访问不会留下任何改动；写入未完成时
+    # 目标里可能保留已写出的部分内容（write_new_file 的既有行为）。
     error = write_new_file(output, document.encode("utf-8"))
     if error is not None:
         return fail(f"无法写入输出文件 {output}: {error}")
