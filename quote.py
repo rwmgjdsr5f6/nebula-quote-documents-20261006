@@ -554,6 +554,43 @@ def cmd_list(args):
     return 0
 
 
+def render_export_json(number, customer, note, item_rows):
+    """渲染单张报价的导出 JSON 文本（以换行结尾），不落盘、不写标准输出。
+
+    这是 export 文本生成规则的唯一规则来源，全部基于入参计算，不打开
+    数据库、不创建文件、不写标准流，可脱离命令行与数据库独立验证；
+    公开 export 入口同样经此函数生成文本，二者始终使用同一套规则。
+
+    输入（均为已从数据库读取的合法内容，本函数不做校验、不重算金额）：
+      - number、customer：报价编号与客户原文，逐字符保留；
+      - note：说明原文；None 或空字符串表示无说明；
+      - item_rows：按 position 升序的 (description, quantity, unit_price)
+        三元组序列，quantity 与 unit_price 为分单位整数。
+
+    返回：一行完整 JSON 字符串，末尾恰好一个 LF。规则：
+      - 结构与 save 接受的输入一致：number、customer、items，非空说明
+        才带 note；不输出内部标识、行金额或合计；
+      - note 为 None 或空字符串时省略 note 键；非空（含纯空白）说明
+        原样输出；
+      - 每条明细只有 description、quantity、unit_price 三键，数量与
+        单价保持 JSON 整数（分单位）；重复说明的明细保持独立，顺序不变；
+      - ensure_ascii=False 保留编号、客户、说明与明细文字原文（含首尾
+        空格、连续空格、换行、尖括号与引号），json.dumps 只做 JSON 所需
+        转义（引号、反斜杠、控制字符），不做 HTML 转义；键顺序固定为
+        number、customer、items、note，明细键序为
+        description、quantity、unit_price。
+    """
+    items = [
+        {"description": description, "quantity": quantity, "unit_price": unit_price}
+        for description, quantity, unit_price in item_rows
+    ]
+    quote = {"number": number, "customer": customer, "items": items}
+    if note:
+        # 非空（含纯空白）说明原样输出；None 或空字符串省略 note。
+        quote["note"] = note
+    return json.dumps(quote, ensure_ascii=False) + "\n"
+
+
 def cmd_export(args):
     # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
     output = args.output
@@ -601,20 +638,11 @@ def cmd_export(args):
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
-    # 导出结构与 save 接受的输入一致：number、customer、items，
-    # 非空说明才带 note；不输出内部标识、行金额或合计。
-    items = [
-        {"description": description, "quantity": quantity, "unit_price": unit_price}
-        for description, quantity, unit_price in item_rows
-    ]
-    quote = {"number": args.number, "customer": customer, "items": items}
-    if note:
-        # 非空（含纯空白）说明原样输出；NULL 或空字符串省略 note。
-        quote["note"] = note
-
-    # 全部读取成功后才生成整份 JSON：失败路径绝不留下部分 JSON。
-    # ensure_ascii=False 保留原文；json.dumps 只做 JSON 所需转义，不做 HTML 转义。
-    document = json.dumps(quote, ensure_ascii=False) + "\n"
+    # 读库之后的 JSON 文本生成全部走纯函数 render_export_json：字段白名单、
+    # note 取舍、整数保持与转义规则均不触碰数据库或文件，与脱离命令行的
+    # 独立验证共用同一套规则。全部读取成功后才生成整份 JSON：失败路径绝不
+    # 留下部分 JSON。
+    document = render_export_json(args.number, customer, note, item_rows)
 
     if output is None:
         # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。

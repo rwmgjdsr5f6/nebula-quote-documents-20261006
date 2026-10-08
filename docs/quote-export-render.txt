@@ -1,0 +1,147 @@
+导出文本生成纯函数 render_export_json：输入、返回与调用方式说明
+================================================================
+
+本次重构把 export 命令中“已读取内容 -> 一行完整 JSON 文本”的规则从
+cmd_export 中抽出，成为可脱离数据库、文件与标准流独立调用的纯函数
+render_export_json；export 入口继续使用同一函数生成文本。命令参数、
+数据库结构、save / preview / list / report 的行为均不改动。
+
+核对基准
+--------
+- 产品源码：quote.py（仓库根目录，唯一可执行源码，当前全文 934 行）。
+  行号均以当前版本为准，引用方式 quote.py:<行号>。
+- 公开文档：README.md“按编号导出 JSON”一节（README.md:82-103）。
+- 回归测试：tests/ 下 21 个文件。本次核对实际运行
+  python3 -m unittest discover -s tests，169 个用例全部通过（约 51 秒）。
+- 证据分级：
+  【源码】只凭阅读当前 quote.py 即可确定的事实，标注函数与行号；
+  【测试】已有回归测试中的断言，标注测试文件与行号；
+  【实测】第三节样例在本次核对时于仓库外临时目录（/tmp/export-check）
+          按文档命令实际执行并通过断言后的结论。
+
+
+一、转换入口：render_export_json
+--------------------------------
+位置【源码：quote.py:557-591】：
+
+  def render_export_json(number, customer, note, item_rows):
+
+这是 export 文本生成规则的唯一规则来源。函数全部基于入参计算：不打开
+数据库、不创建文件、不写标准输出或标准错误，可脱离命令行与数据库独立
+调用与验证。公开 export 入口在读完数据库后调用同一函数生成文本
+（quote.py:645），两条路径始终使用同一套规则，不存在第二份实现。
+
+输入（均为已从数据库读取的合法内容；函数不做校验、不重算金额）：
+  - number：报价编号原文（字符串），逐字符保留；
+  - customer：客户原文（字符串），逐字符保留；
+  - note：说明原文；None 或空字符串表示无说明；
+  - item_rows：按 position 升序的 (description, quantity, unit_price)
+    三元组序列，与 fetch_items(conn, number,
+    ("description", "quantity", "unit_price")) 的返回形状一致
+    （quote.py:242-248）；quantity 与 unit_price 为分单位整数。
+    重复说明的明细各自独立传入，顺序即输出顺序。
+
+返回：一行完整 JSON 字符串（str），末尾恰好一个 LF。规则：
+  - 结构与 save 接受的输入一致：number、customer、items，非空说明
+    才带 note；不输出内部标识（id、position、quote_number）、行金额
+    或合计；
+  - note 为 None 或空字符串时省略 note 键；非空（含纯空白）说明
+    原样输出；
+  - 每条明细只有 description、quantity、unit_price 三键，数量与单价
+    保持 JSON 整数（分单位），不换算为元、浮点或字符串；
+  - ensure_ascii=False 保留编号、客户、说明与明细文字原文（含首尾
+    空格、连续空格、换行、尖括号与引号），json.dumps 只做 JSON 所需
+    转义（引号、反斜杠、控制字符），不做 HTML 转义；键顺序固定为
+    number、customer、items、note，明细键序为
+    description、quantity、unit_price，默认分隔符 ", " 与 ": "。
+
+调用方式（独立调用，无需数据库或任何文件）：
+
+  import sys
+  sys.path.insert(0, "<仓库根目录>")
+  import quote
+  text = quote.render_export_json(
+      "Q-RENDER-001", "演示<甲>&乙\n客户", " 第一行\n第二行 ",
+      [("服务", 2, 1250), ("服务", 1, 0)],
+  )
+
+quote.py 仅使用标准库，import quote 不会执行任何命令（入口受
+if __name__ == "__main__" 保护，quote.py:933-934），也不触碰数据库
+或文件。
+
+
+二、export 入口如何使用同一规则
+-------------------------------
+cmd_export（quote.py:594-660）的职责收缩为流程编排与失败收口：
+
+  1. --output 目标已存在时在读库之前拒绝（quote.py:595-598）；
+  2. 只读打开数据库并逐项探测必要表列（quote.py:601-627）：quotes 需
+     number、customer，items 需 quote_number、position、description、
+     quantity、unit_price；缺表缺列按“无法读取数据库”处理；旧库缺
+     note 列由 find_quote 按无说明处理（quote.py:220-239），缺 total
+     或 line_amount 不妨碍导出；
+  3. 按编号原文读取主行与明细（quote.py:629-635）；
+  4. 调用 render_export_json 生成整份文本（quote.py:645）——全部读取
+     成功后才生成，失败路径绝不留下部分 JSON；
+  5. 省略 --output 时把文本写到标准输出（quote.py:647-650）；指定
+     --output 时以 O_EXCL 新建文件写入同一文本的 UTF-8 字节（无 BOM，
+     quote.py:655-659），成功仅输出路径加换行。
+
+因此“独立调用 render_export_json 的返回”与“export 命令写出的文本”
+对同一份已读取内容逐字节一致；写文件时只是对该文本做
+.encode("utf-8")（quote.py:655），不再改变内容。
+
+
+三、固定合成样例（实测，可照做核对）
+------------------------------------
+样例一：两条同名明细，数量 2 和 1，单价 1250 和 0，客户与说明含换行
+及 <甲>&乙；。
+
+  items = [("服务", 2, 1250), ("服务", 1, 0)]
+  render_export_json("Q-RENDER-001", "演示<甲>&乙\n客户",
+                     " 第一行\n第二行 <甲>&乙 ", items)
+
+【实测】返回与 python3 quote.py export 对同内容数据库的标准输出逐字节
+一致，为下面一行加末尾换行：
+
+{"number": "Q-RENDER-001", "customer": "演示<甲>&乙\n客户", "items": [{"description": "服务", "quantity": 2, "unit_price": 1250}, {"description": "服务", "quantity": 1, "unit_price": 0}], "note": " 第一行\n第二行 <甲>&乙 "}
+
+解析后：两条“服务”各自独立、顺序不变；数量 2、1 与单价 1250、0 为
+JSON 整数；客户与说明逐字符保留（换行在文本中为 JSON 转义 \n，尖括号
+与与号原样出现，无 HTML 实体）；无 total、line_amount、id 等键。
+
+样例二：单价 9223372036854775807（有符号 64 位上限）。
+
+  render_export_json("Q-BIG", "客户", None, [("大额", 1, 9223372036854775807)])
+
+【实测】返回与命令行导出逐字节一致；文本中原样出现
+9223372036854775807，解析后仍为同一整数，无精度损失；note 为 None
+时输出不含 note 键。
+
+note 取舍（纯函数直接核对）：
+  - render_export_json("N", "C", None, items) 与
+    render_export_json("N", "C", "", items) 的输出均不含 note 键；
+  - render_export_json("N", "C", "  \n\t ", items) 的输出含
+    "note": "  \n\t "，纯空白逐字符保留。
+
+边界：函数只转换已读取的合法内容，不增加校验、不重算金额——空明细
+序列也照常转换（render_export_json("N", "C", None, []) 返回
+'{"number": "N", "customer": "C", "items": []}\n'），是否拒绝由
+save 的既有规则决定。
+
+
+四、保持不变的既有行为
+----------------------
+本次只移动文本生成规则，以下行为与重构前一致【测试：169 个用例全部
+通过，覆盖 tests/test_export_flow.py、test_export_file_flow.py、
+test_export_write_flow.py、test_export_close_flow.py 等】：
+  - export 省略 --output 时只向标准输出写 JSON，退出 0、标准错误为空；
+  - 指定新路径时保存相同的 UTF-8 无 BOM 内容，成功仅输出路径加换行；
+  - 输出目标已存在时在读库前拒绝：退出 1、标准输出为空、标准错误说明
+    输出文件已存在，原内容不变；
+  - 编号不存在、数据库不可读或缺少必要表列：退出 1、标准输出为空、
+    标准错误分别说明报价编号不存在或无法读取数据库，不创建输出或
+    数据库；
+  - 输出目录不存在或写入失败：退出 1、标准错误说明无法写入输出文件；
+    写入失败时目标可能保留部分内容的既有边界不变；
+  - save / preview / list / report 的命令参数与行为均不改动。
