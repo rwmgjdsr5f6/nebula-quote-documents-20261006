@@ -433,12 +433,87 @@ def render_list_html(rows):
 """
 
 
+def validate_list_customer_filter(customer_filter):
+    """校验列表的客户筛选值。
+
+    返回原值（含两端空白，供逐字符精确匹配）；空字符串或纯空白抛出
+    ValueError。纯字符串运算，不访问数据库、不创建任何文件。
+    """
+    if customer_filter is not None and not customer_filter.strip():
+        raise ValueError("客户筛选值不能为空白")
+    return customer_filter
+
+
+def organize_list_rows(rows, customer_filter=None):
+    """对读取出的 (number, customer, total) 摘要行执行精确筛选与排序。
+
+    这是列表筛选与排序规则的唯一规则来源，全部基于入参序列计算，不打开
+    数据库、不创建文件、不写标准输出，可脱离命令行与数据库独立验证；
+    公开 list 入口同样经此函数处理，二者始终使用同一套规则：
+      - 筛选：提供 customer_filter 时只保留客户原文与之逐字符相同的行，
+        大小写、首尾空格、连续空格与换行都参与比较，% 与 _ 按普通字符
+        处理，不做子串搜索、LIKE 通配或任何归一化；
+      - 排序：按编号原文的 UTF-8 字节升序，等价于 SQLite TEXT 的
+        BINARY 排序，与输入（保存）顺序无关；
+      - total 原样保留：即库中保存的合计（分单位整数），不重算明细。
+    返回 [(number, customer, total), ...]。
+    """
+    if customer_filter is not None:
+        rows = [
+            (number, customer, total)
+            for number, customer, total in rows
+            if customer == customer_filter
+        ]
+    return sorted(rows, key=lambda row: row[0].encode("utf-8"))
+
+
+def render_list_json(rows):
+    """渲染 list 的单行 JSON 文本（以换行结尾），不落盘、不写标准输出。
+
+    每行仅 number、customer、total 三个字段，total 为分单位 JSON 整数，
+    不换算为元、浮点或字符串；ensure_ascii=False 保留编号与客户原文，
+    json.dumps 只做 JSON 所需转义（引号、换行等），不做 HTML 转义。
+    空结果为 "[]\n"。
+    """
+    records = [
+        {"number": number, "customer": customer, "total": total}
+        for number, customer, total in rows
+    ]
+    return json.dumps(records, ensure_ascii=False) + "\n"
+
+
+def read_list_rows(conn):
+    """只读校验 quotes 表必要列并读取列表所需的 (number, customer, total) 行。
+
+    列表只需要 number、customer、total 三列；旧库缺 note 列或缺 items 表
+    都不影响，不补列、不改动已有数据。缺 quotes 表或必要列、文件不是
+    有效 SQLite 等都抛出 sqlite3.Error。此处不做筛选与排序——规则在
+    organize_list_rows 中，以便脱离数据库独立验证；合计直接读取已保存
+    的 total，不 JOIN items、不重新计算明细。
+    """
+    quote_columns = {row[1] for row in conn.execute("PRAGMA table_info(quotes)")}
+    required_columns = {"number", "customer", "total"}
+    if not quote_columns:
+        raise sqlite3.Error("缺少 quotes 表")
+    if not required_columns <= quote_columns:
+        raise sqlite3.Error(
+            "quotes 表缺少必要列: "
+            + ", ".join(sorted(required_columns - quote_columns))
+        )
+    return conn.execute("SELECT number, customer, total FROM quotes").fetchall()
+
+
 def cmd_list(args):
+    # 本函数只做流程编排与失败收口；客户筛选校验在 validate_list_customer_filter
+    # 中，筛选与排序规则在 organize_list_rows 纯函数中，数据库访问在
+    # read_list_rows 中，输出渲染在 render_list_json / render_list_html 中。
+
     # 客户筛选值在访问数据库与创建输出文件前校验：空字符串或纯空白直接拒绝；
     # 含有效文字时保留两端空白，原样参与精确匹配。
-    customer = args.customer
-    if customer is not None and not customer.strip():
-        return fail("客户筛选值不能为空白")
+    try:
+        customer_filter = validate_list_customer_filter(args.customer)
+    except ValueError as exc:
+        return fail(str(exc))
 
     # 输出目标已存在时在读库之前直接拒绝，绝不覆盖，也不触碰数据库。
     output = args.output
@@ -446,38 +521,25 @@ def cmd_list(args):
         return fail(f"输出文件已存在: {output}")
 
     # 以只读方式打开，数据库不存在或不可访问时不创建任何文件。
-    db_uri = f"file:{pathname2url(os.path.abspath(args.db))}?mode=ro"
     try:
-        conn = sqlite3.connect(db_uri, uri=True)
+        conn = open_readonly_database(args.db)
         try:
-            # 缺表、缺列或文件不是有效 SQLite 都会在此抛出 sqlite3.Error。
-            # number 使用默认 BINARY 排序，与保存先后无关；旧库缺 note 列或
-            # 缺 items 表都不影响本查询，不补结构、不改动已有记录。
-            # 客户筛选用 = 精确比较（BINARY 排序规则）：大小写、空格、换行都参与
-            # 匹配，% 与 _ 等符号按普通字符处理，不做子串搜索或归一化。
-            if customer is None:
-                rows = conn.execute(
-                    "SELECT number, customer, total FROM quotes ORDER BY number"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT number, customer, total FROM quotes "
-                    "WHERE customer = ? ORDER BY number",
-                    (customer,),
-                ).fetchall()
+            # 缺表、缺列或文件不是有效 SQLite 都在 read_list_rows 中
+            # 抛出 sqlite3.Error；旧库缺 note 列或缺 items 表都不影响读取，
+            # 不补结构、不改动已有记录。
+            rows = read_list_rows(conn)
         finally:
             conn.close()
     except sqlite3.Error as exc:
         return fail(f"无法读取数据库 {args.db}: {exc}")
 
+    # 读库之后的筛选与排序全部走纯函数：客户逐字符精确匹配、编号 BINARY
+    # 升序均不触碰数据库或文件，与脱离命令行的独立验证共用同一套规则。
+    rows = organize_list_rows(rows, customer_filter)
+
     if output is None:
         # 未指定 --output：保留既有单行 JSON 行为，不创建任何文件。
-        # 原文输出编号与客户，不做转义或裁剪；total 为分单位整数，不换算。
-        records = [
-            {"number": number, "customer": customer, "total": total}
-            for number, customer, total in rows
-        ]
-        sys.stdout.write(json.dumps(records, ensure_ascii=False) + "\n")
+        sys.stdout.write(render_list_json(rows))
         return 0
 
     document = render_list_html(rows)
